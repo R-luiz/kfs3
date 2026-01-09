@@ -16,7 +16,12 @@ KERNEL_OBJS = boot/boot.o \
               kernel/src/main.o \
               kernel/src/keyboard.o \
               kernel/src/gdt.o \
-              kernel/src/shell.o
+              kernel/src/shell.o \
+              kernel/src/panic.o \
+              kernel/src/pmm.o \
+              kernel/src/paging.o \
+              kernel/src/kmalloc.o \
+              kernel/src/vmalloc.o
 
 # Targets
 .PHONY: all clean run image
@@ -39,5 +44,8 @@ image: kernel.bin
 clean:
 	rm -f $(KERNEL_OBJS) kernel.bin os.img
 
-run: image
-	qemu-system-i386 -hda os.img
+run: kernel.bin
+	qemu-system-i386 -kernel kernel.bin -m 128M -display gtk
+
+run-image: image
+	qemu-system-i386 -hda os.img -m 128M

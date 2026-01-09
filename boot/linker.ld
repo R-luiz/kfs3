@@ -10,6 +10,9 @@ SECTIONS
     /* Your kernel proper starts at 1M */
     . = 1M;
 
+    /* Mark the start of the kernel */
+    kernel_start = .;
+
     .text BLOCK(4K) : ALIGN(4K)
     {
         *(.multiboot)
@@ -31,4 +34,8 @@ SECTIONS
         *(COMMON)
         *(.bss)
     }
+
+    /* Mark the end of the kernel - used by memory manager */
+    . = ALIGN(4K);
+    kernel_end = .;
 }

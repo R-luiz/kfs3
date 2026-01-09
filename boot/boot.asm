@@ -25,8 +25,17 @@ _start:
     ; Setup stack
     mov esp, stack_top
 
+    ; EAX contains multiboot magic number (0x2BADB002)
+    ; EBX contains pointer to multiboot info structure
+    ; Pass both to kernel_main as arguments (C calling convention)
+    push ebx        ; Push multiboot info pointer (2nd arg)
+    push eax        ; Push multiboot magic (1st arg)
+
     ; Call kernel
     call kernel_main
+
+    ; Clean up stack (not really necessary since we halt)
+    add esp, 8
 
     ; If kernel returns, halt the CPU
     cli
