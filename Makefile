@@ -6,6 +6,7 @@ LD = ld
 # Flags
 CFLAGS = -m32 -fno-builtin -fno-exceptions -fno-stack-protector \
          -nostdlib -nodefaultlibs -ffreestanding -O2 -Wall -Wextra \
+         -mno-sse -mno-sse2 -mno-mmx -mno-80387 \
          -I kernel/include
 
 ASMFLAGS = -f elf32
@@ -48,4 +49,19 @@ run: kernel.bin
 	qemu-system-i386 -kernel kernel.bin -m 128M -display gtk
 
 run-image: image
-	qemu-system-i386 -hda os.img -m 128M
+	qemu-system-i386 -drive format=raw,file=os.img -m 128M
+
+# Debug targets
+debug: kernel.bin
+	qemu-system-i386 -kernel kernel.bin -m 128M -d int,cpu_reset -no-reboot -no-shutdown
+
+debug-image: image
+	qemu-system-i386 -drive format=raw,file=os.img -m 128M -d int,cpu_reset -no-reboot -no-shutdown 2>&1 | head -100
+
+# Check multiboot header
+check-multiboot:
+	@echo "Checking multiboot header in kernel.bin..."
+	@xxd kernel.bin | head -20
+	@echo ""
+	@echo "Looking for multiboot magic (0x1BADB002)..."
+	@hexdump -C kernel.bin | grep -i "02 b0 ad 1b" || echo "Magic not found in expected location"

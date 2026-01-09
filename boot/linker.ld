@@ -2,20 +2,20 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Place GDT at physical address 0x00000800, as required */
-    .gdt 0x800 : ALIGN(8) {
-       *(.gdt)
-    }
-    
-    /* Your kernel proper starts at 1M */
+    /* Kernel starts at 1M */
     . = 1M;
 
     /* Mark the start of the kernel */
     kernel_start = .;
 
-    .text BLOCK(4K) : ALIGN(4K)
+    /* Multiboot header must be in the first 8KB of the file */
+    .multiboot BLOCK(4K) : ALIGN(4K)
     {
         *(.multiboot)
+    }
+
+    .text BLOCK(4K) : ALIGN(4K)
+    {
         *(.text)
     }
 
@@ -27,6 +27,7 @@ SECTIONS
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)
+        *(.gdt)
     }
 
     .bss BLOCK(4K) : ALIGN(4K)
