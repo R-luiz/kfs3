@@ -11,6 +11,8 @@ KFS-3 implements a complete memory management system for a bare-metal i386 kerne
 - **Kernel Heap** - `kmalloc`/`kfree` implementation
 - **Virtual Memory Allocator** - `vmalloc`/`vfree` implementation
 - **Kernel Panic Handler** - Error handling with visual feedback
+- **Interactive Shell** - With memory debugging commands
+- **VGA Terminal** - With scrolling, hardware cursor, and backspace support
 
 ## Features
 
@@ -143,19 +145,62 @@ Triggering test kernel panic...
 
 The `panic` command will show a red kernel panic screen and halt the system.
 
+### Debug Session Example
+```
+shell> hexdump 0xb8000 32
+Memory dump at 0x000B8000 (32 bytes):
+0x000B8000: 41 07 4E 07 54 07 48 07  52 07 4F 07 44 07 52 07  |ANTHRODR|
+0x000B8010: 00 07 00 07 00 07 00 07  00 07 00 07 00 07 00 07  |........|
+
+shell> peek 0x100000
+Value at 0x00100000: 0x464C457F (1179403647)
+
+shell> stack
+=== Stack Dump ===
+ESP: 0x0010FFB0  EBP: 0x0010FFD0
+
+Stack contents (64 bytes from ESP):
+0x0010FFB0: 00 00 00 00 10 00 00 00 ...
+
+shell> pagedir
+=== Page Directory ===
+Address: 0x00109000
+
+Mapped page tables:
+  [0] -> 0x0010A000 (RW,K) VA: 0x00000000-0x003FFFFF
+  [1] -> 0x0010B000 (RW,K) VA: 0x00400000-0x007FFFFF
+  ...
+```
+
 ## Shell Commands
 
+### Basic Commands
 | Command | Description |
 |---------|-------------|
 | `help` | Show available commands |
-| `meminfo` | Display memory statistics |
+| `echo TEXT` | Print TEXT to screen |
+| `clear` | Clear screen |
+| `exit` | Exit shell (halts system) |
+| `reboot` | Reboot the system |
+
+### Memory Commands
+| Command | Description |
+|---------|-------------|
+| `meminfo` | Display memory statistics (PMM, heap, vmalloc) |
 | `alloc SIZE` | Allocate SIZE bytes with kmalloc |
 | `free` | Free last allocation |
 | `kheap` | Dump kernel heap state |
 | `vmap` | Show virtual memory mappings |
+
+### Debug Commands (Bonus)
+| Command | Description |
+|---------|-------------|
+| `hexdump ADDR [SIZE]` | Dump memory at ADDR in hex+ASCII (default 64 bytes, max 512) |
+| `peek ADDR` | Read and display 32-bit value at address |
+| `poke ADDR VALUE` | Write 32-bit VALUE to memory address |
+| `stack` | Dump current stack (ESP, EBP, 64 bytes of stack) |
+| `pagedir` | Show page directory entries with permissions |
 | `panic` | Trigger test kernel panic |
-| `clear` | Clear screen |
-| `exit` | Exit shell |
 
 ## Project Structure
 
@@ -251,6 +296,23 @@ void warn(const char *message);
 ASSERT(condition);
 KASSERT(condition, message);
 ```
+
+## Bonus Features
+
+This implementation includes bonus features for memory debugging:
+
+- **Memory Dumping** (`hexdump`) - Hex + ASCII dump of any memory region
+- **Memory Read/Write** (`peek`/`poke`) - Direct memory access for debugging
+- **Stack Inspection** (`stack`) - View current stack pointer and contents
+- **Page Table Debug** (`pagedir`) - Inspect page directory entries with permissions
+- **System Reboot** (`reboot`) - Soft reboot via keyboard controller
+
+These tools are useful for:
+- Debugging memory allocations
+- Inspecting VGA buffer (0xB8000)
+- Verifying page table mappings
+- Examining kernel data structures
+- Testing memory protection
 
 ## Author
 

@@ -18,6 +18,32 @@ static size_t terminal_row;
 static size_t terminal_column;
 static uint8_t terminal_color;
 
+/* Update hardware cursor position */
+static void update_cursor(void) {
+    uint16_t pos = terminal_row * VGA_WIDTH + terminal_column;
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+/* Scroll the terminal up by one line */
+static void terminal_scroll(void) {
+    /* Move all lines up by one */
+    for (size_t y = 1; y < VGA_HEIGHT; y++) {
+        for (size_t x = 0; x < VGA_WIDTH; x++) {
+            size_t src_index = y * VGA_WIDTH + x;
+            size_t dst_index = (y - 1) * VGA_WIDTH + x;
+            VGA_MEMORY[dst_index] = VGA_MEMORY[src_index];
+        }
+    }
+    /* Clear the last line */
+    for (size_t x = 0; x < VGA_WIDTH; x++) {
+        size_t index = (VGA_HEIGHT - 1) * VGA_WIDTH + x;
+        VGA_MEMORY[index] = vga_entry(' ', terminal_color);
+    }
+}
+
 const char* HEADER[] = {
     "    AAAA    N   N  TTTTT  H   H  RRRR   OOO  DDDD   RRRR  ",
     "   A    A   NN  N    T    H   H  R   R O   O D   D  R   R ",
@@ -33,7 +59,7 @@ const char* HEADER[] = {
 /* Make terminal_putchar visible to other files */
 void terminal_putchar(char c);
 
-void terminal_initialize(void) 
+void terminal_initialize(void)
 {
     terminal_row = 0;
     terminal_column = 0;
@@ -46,6 +72,7 @@ void terminal_initialize(void)
             VGA_MEMORY[index] = vga_entry(' ', terminal_color);
         }
     }
+    update_cursor();
 }
 
 static void terminal_putchar_at(char c, uint8_t color, size_t x, size_t y) 
@@ -61,23 +88,43 @@ static size_t strlen(const char* str) {
     return len;
 }
 
-void terminal_putchar(char c) 
+void terminal_putchar(char c)
 {
+    if (c == '\b') {
+        /* Handle backspace: move cursor back and erase character */
+        if (terminal_column > 0) {
+            terminal_column--;
+        } else if (terminal_row > 0) {
+            terminal_row--;
+            terminal_column = VGA_WIDTH - 1;
+        }
+        terminal_putchar_at(' ', terminal_color, terminal_column, terminal_row);
+        update_cursor();
+        return;
+    }
+
     if (c == '\n') {
         terminal_column = 0;
         terminal_row++;
-        if (terminal_row == VGA_HEIGHT)
-            terminal_row = 0;
+        if (terminal_row == VGA_HEIGHT) {
+            terminal_scroll();
+            terminal_row = VGA_HEIGHT - 1;
+        }
+        update_cursor();
         return;
     }
 
     terminal_putchar_at(c, terminal_color, terminal_column, terminal_row);
-    
+
     if (++terminal_column == VGA_WIDTH) {
         terminal_column = 0;
-        if (++terminal_row == VGA_HEIGHT)
-            terminal_row = 0;
+        terminal_row++;
+        if (terminal_row == VGA_HEIGHT) {
+            terminal_scroll();
+            terminal_row = VGA_HEIGHT - 1;
+        }
     }
+    update_cursor();
 }
 
 void terminal_write(const char* str) 
@@ -264,20 +311,34 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
     vmalloc_init();
     terminal_write("  VMalloc ready\n");
 
-    terminal_write("\nMemory initialization complete!\n\n");
+    terminal_write("\nMemory initialization complete!\n");
 
     terminal_write("Printing kernel stack info:\n");
     print_kernel_stack();
 
-    terminal_write("\nType 'help' for available commands.\n\n");
+    terminal_write("\nPress any key to continue...");
 
     /* Initialize the keyboard */
     init_keyboard();
 
+    /* Wait for a key press */
+    while (!(inb(0x64) & 0x01))
+        ;
+    inb(0x60);  /* Consume the key */
+
+    /* Clear screen and show header for shell */
+    terminal_initialize();
+    print_header();
+    terminal_write("\nType 'help' for available commands.\n\n");
+
     /* Launch the shell */
     shell_run();
 
-    /* After exiting the shell, halt the CPU */
+    /* Shell exited - halt the system */
+    terminal_write("\n\nSystem halted.\n");
+
+    /* Disable interrupts and halt CPU */
+    asm volatile("cli");
     while (1) {
         asm volatile("hlt");
     }

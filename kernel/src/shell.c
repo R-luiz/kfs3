@@ -12,8 +12,8 @@
 
 // Simple scancode-to-ASCII mapping (same as before)
 static const char scancode_to_ascii[] = {
-    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0,
-    0, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
     0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
     0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
     '*', 0, ' '
@@ -123,6 +123,66 @@ static void shell_print_size(uint32_t bytes) {
     }
 }
 
+/* Print a single hex byte */
+static void shell_print_byte(uint8_t byte) {
+    char hex_chars[] = "0123456789ABCDEF";
+    terminal_putchar(hex_chars[(byte >> 4) & 0xF]);
+    terminal_putchar(hex_chars[byte & 0xF]);
+}
+
+/* Hexdump memory at address */
+static void shell_hexdump(uint32_t addr, uint32_t size) {
+    uint8_t *ptr = (uint8_t *)addr;
+    uint32_t i, j;
+
+    for (i = 0; i < size; i += 16) {
+        /* Print address */
+        shell_print_hex(addr + i);
+        terminal_write(": ");
+
+        /* Print hex bytes */
+        for (j = 0; j < 16 && (i + j) < size; j++) {
+            shell_print_byte(ptr[i + j]);
+            terminal_putchar(' ');
+            if (j == 7) terminal_putchar(' ');
+        }
+        /* Pad if less than 16 bytes */
+        for (; j < 16; j++) {
+            terminal_write("   ");
+            if (j == 7) terminal_putchar(' ');
+        }
+
+        terminal_write(" |");
+        /* Print ASCII */
+        for (j = 0; j < 16 && (i + j) < size; j++) {
+            char c = ptr[i + j];
+            if (c >= 32 && c < 127)
+                terminal_putchar(c);
+            else
+                terminal_putchar('.');
+        }
+        terminal_write("|\n");
+    }
+}
+
+/* Dump stack contents */
+static void shell_dump_stack(void) {
+    uint32_t esp, ebp;
+    asm volatile("mov %%esp, %0" : "=r"(esp));
+    asm volatile("mov %%ebp, %0" : "=r"(ebp));
+
+    terminal_write("=== Stack Dump ===\n");
+    terminal_write("ESP: ");
+    shell_print_hex(esp);
+    terminal_write("  EBP: ");
+    shell_print_hex(ebp);
+    terminal_write("\n\n");
+
+    /* Dump 64 bytes of stack */
+    terminal_write("Stack contents (64 bytes from ESP):\n");
+    shell_hexdump(esp, 64);
+}
+
 /* Store last kmalloc allocation for free testing */
 static void *last_alloc = NULL;
 static size_t last_alloc_size = 0;
@@ -131,21 +191,21 @@ static size_t last_alloc_size = 0;
  * shell_getchar: busy-polls the keyboard until a key press is detected.
  */
 static char shell_getchar(void) {
-    char c = 0;
     while (1) {
         if (inb(KEYBOARD_STATUS_PORT) & 0x01) {
             uint8_t scancode = inb(KEYBOARD_DATA_PORT);
-            // Only process key press events (ignore releases)
+            /* Only process key press events (ignore releases) */
             if (scancode < sizeof(scancode_to_ascii) && !(scancode & 0x80)) {
-                c = scancode_to_ascii[scancode];
-                // Wait until the key is released to avoid autorepeat issues.
+                char c = scancode_to_ascii[scancode];
+                /* Wait until the key is released to avoid autorepeat issues */
                 while (inb(KEYBOARD_STATUS_PORT) & 0x01)
-                    ;
-                break;
+                    inb(KEYBOARD_DATA_PORT);
+                /* Only return valid characters, ignore unmapped keys */
+                if (c != 0)
+                    return c;
             }
         }
     }
-    return c;
 }
 
 /*
@@ -170,11 +230,9 @@ void shell_run(void) {
             char c = shell_getchar();
 
             /* Handle backspace */
-            if (c == 0x08 || c == '\b') {
+            if (c == '\b') {
                 if (pos > 0) {
                     pos--;
-                    terminal_putchar('\b');
-                    terminal_putchar(' ');
                     terminal_putchar('\b');
                 }
                 continue;
@@ -197,18 +255,24 @@ void shell_run(void) {
         /* Process the input command */
         if (strcmp(buffer, "help") == 0) {
             terminal_write("Built-in commands:\n");
-            terminal_write("  help         - Show this help message\n");
-            terminal_write("  echo TEXT    - Print TEXT\n");
-            terminal_write("  clear        - Clear the screen\n");
-            terminal_write("  ls           - List files (simulated)\n");
-            terminal_write("  exit         - Exit the shell\n");
+            terminal_write("  help          - Show this help message\n");
+            terminal_write("  echo TEXT     - Print TEXT\n");
+            terminal_write("  clear         - Clear the screen\n");
+            terminal_write("  exit          - Exit the shell\n");
+            terminal_write("  reboot        - Reboot the system\n");
             terminal_write("\nMemory commands:\n");
-            terminal_write("  meminfo      - Show memory statistics\n");
-            terminal_write("  alloc SIZE   - Allocate SIZE bytes with kmalloc\n");
-            terminal_write("  free         - Free last allocation\n");
-            terminal_write("  kheap        - Dump kernel heap state\n");
-            terminal_write("  vmap         - Show virtual memory info\n");
-            terminal_write("  panic        - Trigger test kernel panic\n");
+            terminal_write("  meminfo       - Show memory statistics\n");
+            terminal_write("  alloc SIZE    - Allocate SIZE bytes with kmalloc\n");
+            terminal_write("  free          - Free last allocation\n");
+            terminal_write("  kheap         - Dump kernel heap state\n");
+            terminal_write("  vmap          - Show virtual memory info\n");
+            terminal_write("\nDebug commands:\n");
+            terminal_write("  hexdump ADDR [SIZE] - Dump memory (default 64 bytes)\n");
+            terminal_write("  peek ADDR     - Read 32-bit value at address\n");
+            terminal_write("  poke ADDR VAL - Write 32-bit value to address\n");
+            terminal_write("  stack         - Dump current stack\n");
+            terminal_write("  pagedir       - Show page directory info\n");
+            terminal_write("  panic         - Trigger test kernel panic\n");
         } else if (strncmp(buffer, "echo ", 5) == 0) {
             terminal_write(buffer + 5);
             terminal_putchar('\n');
@@ -328,6 +392,104 @@ void shell_run(void) {
         else if (strcmp(buffer, "panic") == 0) {
             terminal_write("Triggering test kernel panic...\n");
             panic("User-triggered test panic");
+        }
+        /* Hexdump command */
+        else if (strncmp(buffer, "hexdump ", 8) == 0) {
+            char *args = buffer + 8;
+            uint32_t addr = parse_hex(args);
+            uint32_t size = 64;  /* Default size */
+            /* Find second argument (size) */
+            while (*args && *args != ' ') args++;
+            if (*args == ' ') {
+                args++;
+                uint32_t parsed_size = parse_uint(args);
+                if (parsed_size > 0) size = parsed_size;
+            }
+            if (size > 512) size = 512;  /* Limit dump size */
+            terminal_write("Memory dump at ");
+            shell_print_hex(addr);
+            terminal_write(" (");
+            shell_print_dec(size);
+            terminal_write(" bytes):\n");
+            shell_hexdump(addr, size);
+        }
+        /* Peek command - read memory */
+        else if (strncmp(buffer, "peek ", 5) == 0) {
+            uint32_t addr = parse_hex(buffer + 5);
+            uint32_t *ptr = (uint32_t *)addr;
+            terminal_write("Value at ");
+            shell_print_hex(addr);
+            terminal_write(": ");
+            shell_print_hex(*ptr);
+            terminal_write(" (");
+            shell_print_dec(*ptr);
+            terminal_write(")\n");
+        }
+        /* Poke command - write memory */
+        else if (strncmp(buffer, "poke ", 5) == 0) {
+            char *args = buffer + 5;
+            uint32_t addr = parse_hex(args);
+            /* Find second argument (value) */
+            while (*args && *args != ' ') args++;
+            if (*args == ' ') {
+                args++;
+                uint32_t value = parse_hex(args);
+                uint32_t *ptr = (uint32_t *)addr;
+                *ptr = value;
+                terminal_write("Wrote ");
+                shell_print_hex(value);
+                terminal_write(" to ");
+                shell_print_hex(addr);
+                terminal_write("\n");
+            } else {
+                terminal_write("Usage: poke ADDR VALUE\n");
+            }
+        }
+        /* Stack dump command */
+        else if (strcmp(buffer, "stack") == 0) {
+            shell_dump_stack();
+        }
+        /* Page directory info command */
+        else if (strcmp(buffer, "pagedir") == 0) {
+            page_directory_t *pd = paging_get_directory();
+            terminal_write("=== Page Directory ===\n");
+            terminal_write("Address: ");
+            shell_print_hex((uint32_t)pd);
+            terminal_write("\n\nMapped page tables:\n");
+            int count = 0;
+            for (int i = 0; i < 1024; i++) {
+                if (pd->entries[i] & PAGE_PRESENT) {
+                    terminal_write("  [");
+                    shell_print_dec(i);
+                    terminal_write("] -> ");
+                    shell_print_hex(pd->entries[i] & 0xFFFFF000);
+                    terminal_write(" (");
+                    if (pd->entries[i] & PAGE_WRITE) terminal_write("RW");
+                    else terminal_write("RO");
+                    if (pd->entries[i] & PAGE_USER) terminal_write(",U");
+                    else terminal_write(",K");
+                    terminal_write(") VA: ");
+                    shell_print_hex(i * 4 * 1024 * 1024);
+                    terminal_write("-");
+                    shell_print_hex((i + 1) * 4 * 1024 * 1024 - 1);
+                    terminal_write("\n");
+                    count++;
+                    if (count >= 10) {
+                        terminal_write("  ... (");
+                        int total = 0;
+                        for (int j = 0; j < 1024; j++)
+                            if (pd->entries[j] & PAGE_PRESENT) total++;
+                        shell_print_dec(total);
+                        terminal_write(" total)\n");
+                        break;
+                    }
+                }
+            }
+        }
+        /* Reboot command */
+        else if (strcmp(buffer, "reboot") == 0) {
+            terminal_write("Rebooting...\n");
+            outb(0x64, 0xFE);
         }
         else if (strcmp(buffer, "exit") == 0) {
             terminal_write("Exiting shell...\n");
