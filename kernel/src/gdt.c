@@ -1,9 +1,23 @@
 #include "gdt.h"
 
-/* Define 7 entries (0=Null, 1=Kernel Code, 2=Kernel Data, 3=Kernel Stack, 
-   4=User Code, 5=User Data, 6=User Stack) */
-struct gdt_entry gdt_entries[7] __attribute__((section(".gdt")));
-struct gdt_ptr gdt_ptr __attribute__((section(".gdt")));
+#define GDT_STRINGIFY_IMPL(value) #value
+#define GDT_STRINGIFY(value) GDT_STRINGIFY_IMPL(value)
+
+/* Build the GDT in normal storage, then copy it to 0x800 before loading it. */
+static struct gdt_entry gdt_entries[GDT_ENTRY_COUNT];
+static struct gdt_ptr gdt_descriptor;
+
+static void gdt_copy_to_low_memory(void)
+{
+    uint8_t *dst = (uint8_t*)GDT_BASE_ADDRESS;
+    const uint8_t *src = (const uint8_t*)gdt_entries;
+    size_t count = sizeof(gdt_entries);
+
+    asm volatile("cld; rep movsb"
+                 : "+D"(dst), "+S"(src), "+c"(count)
+                 :
+                 : "memory");
+}
 
 /* Set an individual GDT entry */
 static void gdt_set_gate(int num, unsigned long base, unsigned long limit, 
@@ -23,9 +37,8 @@ static void gdt_set_gate(int num, unsigned long base, unsigned long limit,
 /* Initialize and load our GDT */
 void init_gdt(void)
 {
-    /* There are 7 entries */
-    gdt_ptr.limit = (sizeof(struct gdt_entry) * 7) - 1;
-    gdt_ptr.base = (unsigned int)&gdt_entries;
+    gdt_descriptor.limit = (sizeof(struct gdt_entry) * GDT_ENTRY_COUNT) - 1;
+    gdt_descriptor.base = GDT_BASE_ADDRESS;
 
     /* Null segment */
     gdt_set_gate(0, 0, 0, 0, 0);
@@ -48,24 +61,26 @@ void init_gdt(void)
     /* User Stack Segment: same as user data */
     gdt_set_gate(6, 0, 0xFFFFFFFF, 0xF2, 0xCF);
 
-    /* Load the new GDT using LGDT */
-    asm volatile("lgdt (%0)" : : "r" (&gdt_ptr));
+    gdt_copy_to_low_memory();
 
-    /* Update segment registers:
-       Here, 0x10 refers to the Kernel Data segment (index 2 * 8 = 16 = 0x10) */
+    /* Load the new GDT using LGDT */
+    asm volatile("lgdt (%0)" : : "r" (&gdt_descriptor));
+
+    /* Load the flat data selector into the data registers and the stack selector into SS. */
     asm volatile (
-        "mov $0x10, %%ax\n"
+        "mov $" GDT_STRINGIFY(GDT_KERNEL_DATA_SELECTOR) ", %%ax\n"
         "mov %%ax, %%ds\n"
         "mov %%ax, %%es\n"
         "mov %%ax, %%fs\n"
         "mov %%ax, %%gs\n"
+        "mov $" GDT_STRINGIFY(GDT_KERNEL_STACK_SELECTOR) ", %%ax\n"
         "mov %%ax, %%ss\n"
         : : : "ax"
     );
 
-    /* Far jump to reload CS (0x08 == Kernel Code segment, index 1 * 8 = 8) */
+    /* Far jump to reload CS with the kernel code selector. */
     asm volatile (
-        "ljmp $0x08, $.flush\n"
+        "ljmp $" GDT_STRINGIFY(GDT_KERNEL_CODE_SELECTOR) ", $.flush\n"
         ".flush:\n"
     );
 }

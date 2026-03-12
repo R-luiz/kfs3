@@ -3,6 +3,16 @@
 
 #include "types.h"
 
+#define GDT_BASE_ADDRESS           0x00000800
+#define GDT_ENTRY_COUNT            7
+
+#define GDT_KERNEL_CODE_SELECTOR   0x08
+#define GDT_KERNEL_DATA_SELECTOR   0x10
+#define GDT_KERNEL_STACK_SELECTOR  0x18
+#define GDT_USER_CODE_SELECTOR     0x20
+#define GDT_USER_DATA_SELECTOR     0x28
+#define GDT_USER_STACK_SELECTOR    0x30
+
 /* A GDT entry is 8 bytes */
 struct gdt_entry {
     uint16_t limit_low;     // Lower 16 bits of limit
@@ -18,10 +28,6 @@ struct gdt_ptr {
     uint16_t limit;         // Limit of the GDT
     uint32_t base;          // Base address of the first gdt_entry
 } __attribute__((packed));
-
-/* We place our GDT in its own section so the linker puts it at 0x800 */
-extern struct gdt_entry gdt_entries[];
-extern struct gdt_ptr gdt_ptr;
 
 /* Initialize and load the GDT */
 void init_gdt(void);

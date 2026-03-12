@@ -1,4 +1,5 @@
 #include "panic.h"
+#include "serial.h"
 #include "vga.h"
 
 /* External VGA functions from main.c */
@@ -65,6 +66,36 @@ static void panic_print_int(int num, size_t row, size_t col, uint8_t color)
     }
 }
 
+static void panic_serial_print_int(int num)
+{
+    char buf[12];
+    int i = 0;
+    int neg = 0;
+
+    if (num < 0) {
+        neg = 1;
+        num = -num;
+    }
+
+    if (num == 0) {
+        serial_write_char('0');
+        return;
+    }
+
+    while (num > 0) {
+        buf[i++] = '0' + (num % 10);
+        num /= 10;
+    }
+
+    if (neg) {
+        buf[i++] = '-';
+    }
+
+    while (i > 0) {
+        serial_write_char(buf[--i]);
+    }
+}
+
 /* Fatal kernel panic */
 void panic(const char *message)
 {
@@ -89,6 +120,10 @@ void panic(const char *message)
     /* Print instructions */
     panic_print("The system has been halted.", 8, msg_color);
     panic_print("Please restart your computer.", 10, msg_color);
+
+    serial_write("\n\nKERNEL PANIC\nError: ");
+    serial_write(message);
+    serial_write("\nThe system has been halted.\nPlease restart your computer.\n");
 
     /* Halt the CPU */
     while (1) {
@@ -127,6 +162,14 @@ void panic_at(const char *message, const char *file, int line)
     /* Print instructions */
     panic_print("The system has been halted.", 12, msg_color);
     panic_print("Please restart your computer.", 14, msg_color);
+
+    serial_write("\n\nKERNEL PANIC\nError: ");
+    serial_write(message);
+    serial_write("\nLocation: ");
+    serial_write(file);
+    serial_write("\nLine: ");
+    panic_serial_print_int(line);
+    serial_write("\nThe system has been halted.\nPlease restart your computer.\n");
 
     /* Halt the CPU */
     while (1) {

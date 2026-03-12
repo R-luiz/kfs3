@@ -2,6 +2,17 @@
 CC = gcc
 ASM = nasm
 LD = ld
+PYTHON ?= python3
+QEMU = qemu-system-i386
+
+QEMU_MEMORY = 128M
+QEMU_DISPLAY_BACKEND = $(shell $(QEMU) -display help 2>/dev/null | sed -n 's/^[[:space:]]*\([[:alnum:]_-][[:alnum:]_-]*\)$$/\1/p' | grep -v '^none$$' | head -n 1)
+
+ifeq ($(strip $(QEMU_DISPLAY_BACKEND)),)
+QEMU_DISPLAY_FLAGS = -nographic -serial stdio -monitor none
+else
+QEMU_DISPLAY_FLAGS = -display $(QEMU_DISPLAY_BACKEND)
+endif
 
 # Flags
 CFLAGS = -m32 -fno-builtin -fno-exceptions -fno-stack-protector \
@@ -16,6 +27,7 @@ LDFLAGS = -m elf_i386 -T boot/linker.ld -nostdlib
 KERNEL_OBJS = boot/boot.o \
               kernel/src/main.o \
               kernel/src/keyboard.o \
+			  kernel/src/serial.o \
               kernel/src/gdt.o \
               kernel/src/shell.o \
               kernel/src/panic.o \
@@ -25,7 +37,7 @@ KERNEL_OBJS = boot/boot.o \
               kernel/src/vmalloc.o
 
 # Targets
-.PHONY: all clean run image
+.PHONY: all clean run image test-kfs
 
 all: kernel.bin
 
@@ -46,17 +58,20 @@ clean:
 	rm -f $(KERNEL_OBJS) kernel.bin os.img
 
 run: kernel.bin
-	qemu-system-i386 -kernel kernel.bin -m 128M -display gtk
+	$(QEMU) -kernel kernel.bin -m $(QEMU_MEMORY) $(QEMU_DISPLAY_FLAGS)
+
+test-kfs:
+	$(PYTHON) tools/test_kfs.py
 
 run-image: image
-	qemu-system-i386 -drive format=raw,file=os.img -m 128M
+	$(QEMU) -drive format=raw,file=os.img -m $(QEMU_MEMORY) $(QEMU_DISPLAY_FLAGS)
 
 # Debug targets
 debug: kernel.bin
-	qemu-system-i386 -kernel kernel.bin -m 128M -d int,cpu_reset -no-reboot -no-shutdown
+	$(QEMU) -kernel kernel.bin -m $(QEMU_MEMORY) $(QEMU_DISPLAY_FLAGS) -d int,cpu_reset -no-reboot -no-shutdown
 
 debug-image: image
-	qemu-system-i386 -drive format=raw,file=os.img -m 128M -d int,cpu_reset -no-reboot -no-shutdown 2>&1 | head -100
+	$(QEMU) -drive format=raw,file=os.img -m $(QEMU_MEMORY) $(QEMU_DISPLAY_FLAGS) -d int,cpu_reset -no-reboot -no-shutdown 2>&1 | head -100
 
 # Check multiboot header
 check-multiboot:

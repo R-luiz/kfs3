@@ -1,4 +1,5 @@
 #include "vmalloc.h"
+#include "kmalloc.h"
 #include "pmm.h"
 #include "paging.h"
 #include "panic.h"
@@ -6,7 +7,8 @@
 /* Virtual memory region descriptor */
 typedef struct vm_region {
     uint32_t virt_addr;         /* Virtual start address */
-    uint32_t size;              /* Size in bytes */
+    uint32_t size;              /* Requested size in bytes */
+    uint32_t mapped_size;       /* Mapped size in bytes */
     uint32_t num_pages;         /* Number of pages */
     struct vm_region *next;     /* Next region */
     uint32_t magic;             /* Magic number for validation */
@@ -20,7 +22,7 @@ typedef struct vm_region {
 #define VMALLOC_START   0x01000000      /* 16 MB */
 #define VMALLOC_END     0x10000000      /* 256 MB */
 
-/* Current allocation pointer */
+/* Current virtual break used by vmalloc/vbrk. */
 static uint32_t vmalloc_current = VMALLOC_START;
 
 /* List of allocated regions */
@@ -43,6 +45,45 @@ static void *vmalloc_memset(void *ptr, int value, size_t size)
     return ptr;
 }
 
+static uint32_t vmalloc_highest_end(void)
+{
+    uint32_t highest = VMALLOC_START;
+    vm_region_t *current = region_list;
+
+    while (current) {
+        uint32_t end = current->virt_addr + current->mapped_size;
+        if (end > highest) {
+            highest = end;
+        }
+        current = current->next;
+    }
+
+    return highest;
+}
+
+static vm_region_t *vmalloc_find_region(void *ptr, vm_region_t **prev_region)
+{
+    vm_region_t *previous = NULL;
+    vm_region_t *current = region_list;
+    uint32_t virt_addr = (uint32_t)ptr;
+
+    while (current) {
+        if (current->magic == VM_MAGIC && current->virt_addr == virt_addr) {
+            if (prev_region) {
+                *prev_region = previous;
+            }
+            return current;
+        }
+        previous = current;
+        current = current->next;
+    }
+
+    if (prev_region) {
+        *prev_region = NULL;
+    }
+    return NULL;
+}
+
 /* Initialize vmalloc */
 void vmalloc_init(void)
 {
@@ -56,6 +97,7 @@ void vmalloc_init(void)
 void *vbrk(int increment)
 {
     uint32_t old_current = vmalloc_current;
+    uint32_t min_current = vmalloc_highest_end();
 
     if (increment == 0) {
         return (void*)vmalloc_current;
@@ -72,8 +114,8 @@ void *vbrk(int increment)
         vmalloc_current = new_current;
     } else {
         uint32_t new_current = vmalloc_current + increment;
-        if (new_current < VMALLOC_START) {
-            new_current = VMALLOC_START;
+        if (new_current < min_current) {
+            new_current = min_current;
         }
         vmalloc_current = new_current;
     }
@@ -93,8 +135,14 @@ void *vmalloc(size_t size)
     uint32_t alloc_size = num_pages * PAGE_SIZE;
 
     /* Check if we have enough virtual address space */
-    if (vmalloc_current + alloc_size + sizeof(vm_region_t) > VMALLOC_END) {
+    if (vmalloc_current + alloc_size > VMALLOC_END) {
         warn("vmalloc: Out of virtual address space");
+        return NULL;
+    }
+
+    vm_region_t *region = (vm_region_t*)kmalloc(sizeof(vm_region_t));
+    if (region == NULL) {
+        warn("vmalloc: Out of kernel memory for metadata");
         return NULL;
     }
 
@@ -111,6 +159,7 @@ void *vmalloc(size_t size)
                 paging_unmap_page(addr);
                 pmm_free_frame(phys);
             }
+            kfree(region);
             warn("vmalloc: Out of physical memory");
             return NULL;
         }
@@ -122,14 +171,9 @@ void *vmalloc(size_t size)
         vmalloc_memset((void*)(virt_addr + i * PAGE_SIZE), 0, PAGE_SIZE);
     }
 
-    /* Create region descriptor (stored in kernel heap) */
-    /* For simplicity, we store the descriptor at a fixed location */
-    vm_region_t *region = (vm_region_t*)virt_addr;
-
-    /* Actually, let's use the first few bytes of the first page for the descriptor */
-    /* This means the usable memory starts after the descriptor */
     region->virt_addr = virt_addr;
-    region->size = alloc_size;
+    region->size = (uint32_t)size;
+    region->mapped_size = alloc_size;
     region->num_pages = num_pages;
     region->magic = VM_MAGIC;
     region->next = region_list;
@@ -142,8 +186,7 @@ void *vmalloc(size_t size)
     /* Update current pointer */
     vmalloc_current += alloc_size;
 
-    /* Return pointer after the region header */
-    return (void*)(virt_addr + sizeof(vm_region_t));
+    return (void*)virt_addr;
 }
 
 /* Free virtual memory */
@@ -153,13 +196,18 @@ void vfree(void *ptr)
         return;
     }
 
-    /* Get region descriptor (stored just before the pointer) */
-    vm_region_t *region = (vm_region_t*)((uint8_t*)ptr - sizeof(vm_region_t));
+    vm_region_t *prev_region = NULL;
+    vm_region_t *region = vmalloc_find_region(ptr, &prev_region);
 
-    /* Validate */
-    if (region->magic != VM_MAGIC) {
+    if (region == NULL) {
         panic("vfree: Invalid region (corrupted or double-free)");
         return;
+    }
+
+    if (prev_region) {
+        prev_region->next = region->next;
+    } else {
+        region_list = region->next;
     }
 
     /* Unmap and free physical pages */
@@ -173,25 +221,14 @@ void vfree(void *ptr)
         }
     }
 
-    /* Remove from list */
-    if (region_list == region) {
-        region_list = region->next;
-    } else {
-        vm_region_t *prev = region_list;
-        while (prev && prev->next != region) {
-            prev = prev->next;
-        }
-        if (prev) {
-            prev->next = region->next;
-        }
-    }
-
     /* Update statistics */
     total_regions--;
     total_pages_allocated -= region->num_pages;
 
     /* Invalidate magic */
     region->magic = 0;
+    kfree(region);
+    vmalloc_current = vmalloc_highest_end();
 }
 
 /* Get size of virtual allocation */
@@ -201,20 +238,18 @@ size_t vsize(void *ptr)
         return 0;
     }
 
-    vm_region_t *region = (vm_region_t*)((uint8_t*)ptr - sizeof(vm_region_t));
-
-    if (region->magic != VM_MAGIC) {
+    vm_region_t *region = vmalloc_find_region(ptr, NULL);
+    if (region == NULL) {
         return 0;
     }
 
-    /* Return usable size (total size minus header) */
-    return region->size - sizeof(vm_region_t);
+    return region->size;
 }
 
 /* Get statistics */
 void vmalloc_get_stats(vmalloc_stats_t *stats)
 {
-    stats->total_virtual = vmalloc_current - VMALLOC_START;
+    stats->total_virtual = total_pages_allocated * PAGE_SIZE;
     stats->used_virtual = total_pages_allocated * PAGE_SIZE;
     stats->num_regions = total_regions;
 }
@@ -283,6 +318,8 @@ void vmalloc_dump(void)
         print_dec_vm(current->num_pages);
         terminal_write(" size=");
         print_dec_vm(current->size);
+        terminal_write(" mapped=");
+        print_dec_vm(current->mapped_size);
         terminal_write("\n");
         current = current->next;
     }

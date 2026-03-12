@@ -123,8 +123,14 @@ void paging_map_page(uint32_t virt_addr, uint32_t phys_addr, uint32_t flags)
         memset_paging(table, 0, sizeof(page_table_t));
 
         /* Add to directory */
-        current_directory->entries[dir_idx] = table_phys | PAGE_KERNEL;
+        current_directory->entries[dir_idx] = table_phys | PAGE_PRESENT | PAGE_WRITE;
+        if (flags & PAGE_USER) {
+            current_directory->entries[dir_idx] |= PAGE_USER;
+        }
     } else {
+        if (flags & PAGE_USER) {
+            current_directory->entries[dir_idx] |= PAGE_USER;
+        }
         table = (page_table_t*)PAGE_FRAME(current_directory->entries[dir_idx]);
     }
 

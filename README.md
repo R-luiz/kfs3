@@ -66,14 +66,16 @@ sudo apt install gcc nasm qemu-system-x86 gcc-multilib
 ### Quick Start
 ```bash
 make        # Build the kernel
-make run    # Run in QEMU
+make run    # Run in QEMU (auto-falls back to headless serial if no GUI backend exists)
+make test-kfs  # Run the automated KFS-2/KFS-3 test suite
 ```
 
 ### All Make Targets
 | Command | Description |
 |---------|-------------|
 | `make` | Build kernel.bin |
-| `make run` | Build and run in QEMU (direct multiboot) |
+| `make run` | Build and run in QEMU (GUI when available, otherwise headless serial) |
+| `make test-kfs` | Run static + runtime checks for KFS-2 and KFS-3 |
 | `make image` | Create bootable disk image (os.img) |
 | `make run-image` | Run from disk image (requires GRUB) |
 | `make clean` | Remove build artifacts |
@@ -83,12 +85,21 @@ make run    # Run in QEMU
 # Direct multiboot (recommended)
 qemu-system-i386 -kernel kernel.bin -m 128M
 
-# With curses display (text mode)
-qemu-system-i386 -kernel kernel.bin -m 128M -curses
+# Headless serial console
+qemu-system-i386 -kernel kernel.bin -m 128M -nographic -serial stdio -monitor none
 
 # From disk image
 qemu-system-i386 -hda os.img -m 128M
 ```
+
+When QEMU has no graphical display backend, the kernel mirrors console output to COM1 and accepts shell input from the serial terminal.
+
+### Automated Tests
+```bash
+python3 tools/test_kfs.py
+```
+
+The test script mixes static checks with headless QEMU runtime checks. It verifies the KFS-2 GDT and stack requirements, KFS-3 memory and panic requirements, and the shell/debug bonus surface that is currently implemented in this repository.
 
 ## Usage
 

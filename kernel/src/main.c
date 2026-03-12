@@ -1,6 +1,7 @@
 #include "types.h"
 #include "vga.h"
 #include "keyboard.h"
+#include "serial.h"
 #include "gdt.h"
 #include "shell.h"
 #include "multiboot.h"
@@ -17,6 +18,9 @@ static const size_t VGA_HEIGHT = 25;
 static size_t terminal_row;
 static size_t terminal_column;
 static uint8_t terminal_color;
+
+extern uint8_t stack_bottom;
+extern uint8_t stack_top;
 
 /* Update hardware cursor position */
 static void update_cursor(void) {
@@ -51,7 +55,7 @@ const char* HEADER[] = {
     "   A    A   N  NN    T    H   H  R  R  O   O D   D  R  R  ",
     "   A    A   N   N    T    H   H  R   R  OOO  DDDD   R   R ",
     "",
-    "               Anthrodr - KFS-3 (Memory & Paging)            ",
+    "               Anthrodr - KFS-2-3-4 (Memory & Paging)            ",
     "",
     NULL
 };
@@ -90,6 +94,8 @@ static size_t strlen(const char* str) {
 
 void terminal_putchar(char c)
 {
+    serial_write_char(c);
+
     if (c == '\b') {
         /* Handle backspace: move cursor back and erase character */
         if (terminal_column > 0) {
@@ -172,18 +178,84 @@ static void print_hex(uint32_t num) {
     terminal_write(str);
 }
 
-/* Print the current kernel stack pointer (ESP) */
+static void print_hex_byte(uint8_t byte)
+{
+    char hex_chars[] = "0123456789ABCDEF";
+    terminal_putchar(hex_chars[(byte >> 4) & 0xF]);
+    terminal_putchar(hex_chars[byte & 0xF]);
+}
+
+static void print_memory_size(uint32_t bytes);
+
+static void print_stack_dump(uint32_t addr, uint32_t size)
+{
+    uint8_t *ptr = (uint8_t*)addr;
+
+    for (uint32_t i = 0; i < size; i += 16) {
+        print_hex(addr + i);
+        terminal_write(": ");
+
+        uint32_t j = 0;
+        for (; j < 16 && (i + j) < size; j++) {
+            print_hex_byte(ptr[i + j]);
+            terminal_putchar(' ');
+            if (j == 7) {
+                terminal_putchar(' ');
+            }
+        }
+
+        for (; j < 16; j++) {
+            terminal_write("   ");
+            if (j == 7) {
+                terminal_putchar(' ');
+            }
+        }
+
+        terminal_write(" |");
+        for (j = 0; j < 16 && (i + j) < size; j++) {
+            char c = (char)ptr[i + j];
+            if (c >= 32 && c < 127) {
+                terminal_putchar(c);
+            } else {
+                terminal_putchar('.');
+            }
+        }
+        terminal_write("|\n");
+    }
+}
+
+/* Print the configured stack range and a small dump around ESP. */
 static void print_kernel_stack(void)
 {
     uint32_t esp;
-    
-    // Retrieve current ESP with a memory clobber
-    asm volatile("movl %%esp, %0" : "=r"(esp) : : "memory");
+    uint32_t ebp;
+    uint32_t stack_low = (uint32_t)&stack_bottom;
+    uint32_t stack_high = (uint32_t)&stack_top;
 
-    terminal_write("\nKernel stack pointer (ESP): 0x");
+    asm volatile("movl %%esp, %0" : "=r"(esp) : : "memory");
+    asm volatile("movl %%ebp, %0" : "=r"(ebp) : : "memory");
+
+    terminal_write("\n=== Kernel Stack ===\n");
+    terminal_write("Range: 0x");
+    print_hex(stack_low);
+    terminal_write(" - 0x");
+    print_hex(stack_high);
+    terminal_write("\nESP: 0x");
     print_hex(esp);
+    terminal_write("  EBP: 0x");
+    print_hex(ebp);
     terminal_write("\n");
-    
+
+    if (esp >= stack_low && esp <= stack_high) {
+        terminal_write("Used bytes: ");
+        print_memory_size(stack_high - esp);
+        terminal_write("\n");
+    } else {
+        terminal_write("Stack pointer is outside the configured stack range\n");
+    }
+
+    terminal_write("Stack contents (64 bytes from ESP):\n");
+    print_stack_dump(esp, 64);
 }
 
 
@@ -265,6 +337,7 @@ static void print_memory_size(uint32_t bytes)
 
 void kernel_main(uint32_t magic, multiboot_info_t *mbi)
 {
+    serial_init();
     terminal_initialize();
 
     /* Initialize the Global Descriptor Table */
@@ -321,10 +394,15 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
     /* Initialize the keyboard */
     init_keyboard();
 
-    /* Wait for a key press */
-    while (!(inb(0x64) & 0x01))
+    /* Wait for keyboard or serial input */
+    while (!(inb(KEYBOARD_STATUS_PORT) & 0x01) && !serial_has_data())
         ;
-    inb(0x60);  /* Consume the key */
+
+    if (serial_has_data()) {
+        serial_read_char();
+    } else {
+        inb(KEYBOARD_DATA_PORT);  /* Consume the key */
+    }
 
     /* Clear screen and show header for shell */
     terminal_initialize();

@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "vga.h"
 #include "keyboard.h"
+#include "serial.h"
 #include "types.h"
 #include "pmm.h"
 #include "kmalloc.h"
@@ -192,6 +193,20 @@ static size_t last_alloc_size = 0;
  */
 static char shell_getchar(void) {
     while (1) {
+        if (serial_has_data()) {
+            char c = serial_read_char();
+
+            if (c == '\r' || c == '\n') {
+                return '\n';
+            }
+            if (c == '\b' || c == 0x7F) {
+                return '\b';
+            }
+            if (c == '\t' || (c >= 32 && c < 127)) {
+                return c;
+            }
+        }
+
         if (inb(KEYBOARD_STATUS_PORT) & 0x01) {
             uint8_t scancode = inb(KEYBOARD_DATA_PORT);
             /* Only process key press events (ignore releases) */
