@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,36 @@ def clean_output(text: str) -> str:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=None)
+def read_text_cached(path: Path) -> str:
+    return read_text(path)
+
+
+@lru_cache(maxsize=1)
+def repository_source_files() -> tuple[Path, ...]:
+    files: list[Path] = []
+
+    for relative_dir in ["boot", "kernel"]:
+        for path in sorted((ROOT / relative_dir).rglob("*")):
+            if path.is_file() and path.suffix in {".asm", ".c", ".h", ".ld", ".s", ".S"}:
+                files.append(path)
+
+    return tuple(files)
+
+
+def repo_has_regex(pattern: str) -> bool:
+    regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    return any(regex.search(read_text_cached(path)) for path in repository_source_files())
+
+
+def repo_has_any(patterns: list[str]) -> bool:
+    return any(repo_has_regex(pattern) for pattern in patterns)
+
+
+def repo_has_all(patterns: list[str]) -> bool:
+    return all(repo_has_regex(pattern) for pattern in patterns)
 
 
 def run_command(command: list[str], timeout: int = 180) -> subprocess.CompletedProcess[str]:
@@ -229,6 +260,20 @@ def parse_alloc_address(output: str) -> int | None:
     return int(match.group(1), 16)
 
 
+def parse_demo_pids(output: str) -> list[int]:
+    match = re.search(r"Created demo processes:\s*(\d+),\s*(\d+)", clean_output(output))
+    if match is None:
+        return []
+    return [int(match.group(1)), int(match.group(2))]
+
+
+def parse_fork_child_pid(output: str) -> int | None:
+    match = re.search(r"child PID\s+(\d+)", clean_output(output))
+    if match is None:
+        return None
+    return int(match.group(1), 10)
+
+
 def gdt_matches_expected(actual: bytes) -> bool:
     if len(actual) < len(EXPECTED_GDT):
         return False
@@ -255,6 +300,8 @@ def static_checks(report: Reporter) -> None:
     panic_header = read_text(ROOT / "kernel/include/panic.h")
     main_source = read_text(ROOT / "kernel/src/main.c")
     shell_source = read_text(ROOT / "kernel/src/shell.c")
+    panic_source = read_text(ROOT / "kernel/src/panic.c")
+    keyboard_source = read_text(ROOT / "kernel/src/keyboard.c")
     create_image = read_text(ROOT / "tools/create_image.sh")
 
     required_flags = [
@@ -352,6 +399,312 @@ def static_checks(report: Reporter) -> None:
         "Debug shell commands are implemented",
         all(token in shell_source for token in ["hexdump", "peek", "poke", "stack", "pagedir", "panic"]),
     )
+
+    idt_descriptor_present = repo_has_any([
+        r"struct\s+idt_(entry|gate)",
+        r"typedef\s+struct\s+[^\n]*idt[^\n]*\{",
+        r"\bidt_entry_t\b",
+        r"\bidt_gate_t\b",
+    ])
+    idt_setup_present = repo_has_any([
+        r"\binit_idt\b",
+        r"\bidt_init\b",
+        r"\bidt_set_gate\b",
+        r"\bregister_idt\b",
+    ])
+    idt_load_present = repo_has_any([
+        r"\blidt\b",
+        r"\bload_idt\b",
+    ])
+    report.add(
+        "KFS4 mandatory",
+        "IDT setup code appears to create, fill, and register an interrupt table",
+        idt_descriptor_present and idt_setup_present and idt_load_present,
+    )
+
+    signal_callback_present = repo_has_any([
+        r"\bsignal_callback_t\b",
+        r"\bsignal_handler_t\b",
+        r"typedef\s+[^\n]*signal[^\n]*(callback|handler)",
+    ]) and repo_has_any([
+        r"\b(register|set|install)_signal_(handler|callback)\b",
+        r"\bsignal_(register|set|install)_(handler|callback)\b",
+    ])
+    report.add(
+        "KFS4 mandatory",
+        "Kernel API exposes a signal callback registration path",
+        signal_callback_present,
+    )
+
+    signal_scheduling_present = repo_has_any([
+        r"\bschedule_signal\b",
+        r"\benqueue_signal\b",
+        r"\bqueue_signal\b",
+        r"\bsignal_scheduler\b",
+    ]) and repo_has_any([
+        r"\bpending_signals?\b",
+        r"\bdispatch_signal\b",
+        r"\bdeliver_signal\b",
+    ])
+    report.add(
+        "KFS4 mandatory",
+        "Kernel API exposes signal scheduling or delivery state",
+        signal_scheduling_present,
+    )
+
+    register_cleanup_interface = repo_has_any([
+        r"\b(clean|clear|zero|sanitize)_registers\b",
+        r"\bregister_snapshot\b",
+        r"\bsaved_registers\b",
+        r"struct\s+(cpu_)?registers\b",
+        r"\bpanic_registers\b",
+    ])
+    panic_cleans_registers = register_cleanup_interface and (
+        repo_has_any([
+            r"xor\s+%e[abcds][xip],\s*%e[abcds][xip]",
+            r"mov\s+\$0,\s*%e[abcds][xip]",
+        ])
+        or re.search(r"(clean|clear|zero|sanitize)_registers", panic_source, re.IGNORECASE) is not None
+    )
+    report.add(
+        "KFS4 mandatory",
+        "Panic or halt path includes an explicit register cleanup interface",
+        panic_cleans_registers,
+    )
+
+    stack_save_interface = repo_has_any([
+        r"\bsave_stack\b",
+        r"\bstack_snapshot\b",
+        r"\bsaved_stack\b",
+        r"\bpanic_stack\b",
+        r"\bstack_trace_on_panic\b",
+    ])
+    panic_saves_stack = stack_save_interface and re.search(r"stack|esp|ebp", panic_source, re.IGNORECASE) is not None
+    report.add(
+        "KFS4 mandatory",
+        "Panic path appears to save stack state before halting",
+        panic_saves_stack,
+    )
+
+    keyboard_interrupt_present = "keyboard_handler" in keyboard_source and repo_has_any([
+        r"\birq1\b",
+        r"\bIRQ1\b",
+        r"\bkeyboard_interrupt\b",
+        r"idt_set_gate\s*\(\s*33\b",
+        r"0x21",
+        r"\bpic_(remap|send_eoi)\b",
+    ])
+    report.add(
+        "KFS4 mandatory",
+        "Keyboard handling appears to be wired through the IDT or IRQ1 path",
+        keyboard_interrupt_present,
+    )
+
+    syscall_foundation_present = repo_has_any([
+        r"\bsyscall\b",
+        r"\bsyscall_table\b",
+        r"\bsyscall_handler\b",
+        r"int\s*\$?0x80",
+        r"idt_set_gate\s*\(\s*128\b",
+    ])
+    report.add(
+        "KFS4 bonus",
+        "A syscall entry foundation appears to exist",
+        syscall_foundation_present,
+    )
+
+    keyboard_bonus_present = repo_has_any([
+        r"\bget_line\b",
+        r"\bread_line\b",
+        r"\bkeyboard_layout\b",
+        r"\bazerty\b",
+        r"\bqwerty\b",
+    ])
+    report.add(
+        "KFS4 bonus",
+        "Keyboard API includes either buffered line input or layout support",
+        keyboard_bonus_present,
+    )
+
+    process_structure_present = repo_has_any([
+        r"struct\s+(process|task|proc)\b",
+        r"\b(process|task|proc)_t\b",
+    ]) and repo_has_any([
+        r"\bpid\b",
+        r"\bpid_t\b",
+    ]) and repo_has_any([
+        r"\bstatus\b",
+        r"\bstate\b",
+        r"\bzombie\b",
+        r"\bthread\b",
+    ]) and repo_has_any([
+        r"\bparent\b",
+        r"\bfather\b",
+    ]) and repo_has_any([
+        r"\bchildren\b",
+        r"\bchild_list\b",
+    ]) and repo_has_any([
+        r"\bowner\b",
+        r"\buid\b",
+        r"\buser_id\b",
+    ]) and repo_has_any([
+        r"\b(signal_queue|pending_signals|queued_signals|current_signals)\b",
+    ]) and repo_has_any([
+        r"\b(process_stack|user_stack|kernel_stack|stack_base|stack_top)\b",
+    ]) and repo_has_any([
+        r"\b(process_heap|heap_start|heap_end|heap_break)\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "Process structures appear to track PID, state, kinship, owner, signals, stack, and heap",
+        process_structure_present,
+    )
+
+    process_signal_queue_present = repo_has_any([
+        r"\b(queue|enqueue|schedule)_process_signal\b",
+        r"\bprocess_(queue|enqueue|schedule)_signal\b",
+        r"\btask_(queue|enqueue|schedule)_signal\b",
+        r"\bdeliver_process_signal\b",
+    ]) and repo_has_any([
+        r"\b(next_cpu_tick|cpu_tick|timer_tick|scheduler_tick)\b",
+        r"\bpending_process_signals\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "The kernel appears to queue process signals for delivery on a CPU tick",
+        process_signal_queue_present,
+    )
+
+    process_socket_helpers_present = repo_has_any([
+        r"\b(process|task|ipc)_socket(_t)?\b",
+        r"\b(socket_create|socket_send|socket_recv|socket_connect|socket_close)\b",
+        r"\bipc_(send|recv|socket)\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "Process socket or IPC helpers appear to exist",
+        process_socket_helpers_present,
+    )
+
+    process_memory_helpers_present = repo_has_any([
+        r"\b(process|task)_(alloc|map|unmap|clone|copy)_(page|memory|space)\b",
+        r"\b(copy|clone)_(address_space|page_directory)\b",
+        r"\bprocess_memory_(alloc|map|free)\b",
+    ]) and repo_has_any([
+        r"\b(address_space|page_directory|page_table|process_cr3|process_page)\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "Helpers for process memory management appear to be present",
+        process_memory_helpers_present,
+    )
+
+    fork_helper_present = repo_has_any([
+        r"\bfork_process\b",
+        r"\bprocess_fork\b",
+        r"\bcopy_process\b",
+        r"\bclone_process\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "A full process copy or fork helper appears to exist",
+        fork_helper_present,
+    )
+
+    process_syscall_helpers_present = repo_has_any([
+        r"\b(wait_process|process_wait|sys_wait|do_wait)\b",
+    ]) and repo_has_any([
+        r"\b(process_exit|sys_exit|do_exit|_exit)\b",
+    ]) and repo_has_any([
+        r"\b(getuid|sys_getuid|process_getuid)\b",
+    ]) and repo_has_any([
+        r"\b(sys_signal|process_signal|send_signal_to_process)\b",
+    ]) and repo_has_any([
+        r"\b(sys_kill|kill_process|process_kill)\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "Helpers preparing wait, exit, getuid, signal, and kill syscalls appear to exist",
+        process_syscall_helpers_present,
+    )
+
+    process_memory_separation_present = repo_has_any([
+        r"\b(assign|alloc)_process_page\b",
+        r"\bprocess_page\b",
+        r"\bprocess_memory_map\b",
+        r"\bprocess_page_directory\b",
+        r"\baddress_space\b",
+    ]) and repo_has_any([
+        r"\b(track|record|store)_.*(virtual|vm|page)\b",
+        r"\bvirtual_base\b",
+        r"\bvirtual_page\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "Process memory separation appears to track dedicated per-process pages or address spaces",
+        process_memory_separation_present,
+    )
+
+    multitasking_present = repo_has_any([
+        r"\bmultitask(ing)?\b",
+        r"\bscheduler_tick\b",
+        r"\bschedule_next\b",
+        r"\bschedule_process\b",
+        r"\bpick_next_process\b",
+        r"\bcontext_switch\b",
+        r"\btask_switch\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "A multitasking or scheduler path appears to exist",
+        multitasking_present,
+    )
+
+    exec_fn_present = repo_has_any([
+        r"\bexec_fn\b",
+        r"\bexecute_function_as_process\b",
+        r"\bspawn_function_process\b",
+    ])
+    report.add(
+        "KFS5 mandatory",
+        "An in-kernel exec_fn-style process test hook appears to exist",
+        exec_fn_present,
+    )
+
+    mmap_bonus_present = repo_has_any([
+        r"\b(sys_mmap|do_mmap|process_mmap|task_mmap|mmap_process)\b",
+        r"\bprocess_mmap\b",
+        r"\btask_mmap\b",
+    ])
+    report.add(
+        "KFS5 bonus",
+        "mmap-like per-process virtual memory helpers appear to exist",
+        mmap_bonus_present,
+    )
+
+    idt_process_bonus_present = repo_has_any([
+        r"\bcurrent_process\b",
+        r"\bcurrent_task\b",
+    ]) and repo_has_any([
+        r"\b(idt_handle_interrupt|interrupt_process_signal|process_signal_from_interrupt|deliver_process_signal)\b",
+    ])
+    report.add(
+        "KFS5 bonus",
+        "Interrupt handling appears to be linked to per-process signal delivery",
+        idt_process_bonus_present,
+    )
+
+    process_segments_bonus_present = repo_has_any([
+        r"\b(process|task)_(bss|data)\b",
+        r"\bbss_(start|end|size)\b",
+        r"\bdata_(start|end|size)\b",
+    ])
+    report.add(
+        "KFS5 bonus",
+        "Process structures appear to track dedicated BSS or data segments",
+        process_segments_bonus_present,
+    )
+
     report.add(
         "General",
         "Image script stays within the 10 MiB subject limit",
@@ -380,12 +733,51 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             ]),
             boot_output,
         )
+        report.add(
+            "KFS4 mandatory",
+            "Boot sequence reports IDT, signal, syscall, and keyboard IRQ initialization",
+            all(token in boot_output for token in [
+                "Initializing Interrupt Descriptor Table...",
+                "IDT ready (PIC remapped)",
+                "Initializing Signal Callback Interface...",
+                "Signal scheduler ready",
+                "Initializing Syscall Interface...",
+                "int 0x80 handler ready",
+                "Initializing IDT keyboard handling...",
+                "Keyboard IRQ1 ready",
+                "Interrupts enabled",
+            ]),
+            boot_output,
+        )
+        report.add(
+            "KFS5 mandatory",
+            "Boot sequence reports process and scheduler initialization",
+            all(token in boot_output for token in [
+                "Initializing Process Interface...",
+                "Kernel process ready",
+                "Initializing Multitasking Scheduler...",
+                "Scheduler and CPU tick ready",
+            ]),
+            boot_output,
+        )
 
         help_output = clean_output(session.run_command("help"))
         report.add(
             "KFS2 bonus",
             "Shell help lists the expected built-in and debug commands",
             all(token in help_output for token in ["help", "echo TEXT", "reboot", "meminfo", "stack", "panic"]),
+            help_output,
+        )
+        report.add(
+            "KFS4 mandatory",
+            "Shell help exposes the interrupt and signal debug commands",
+            all(token in help_output for token in ["idt", "signals", "sigtest", "syscall", "int3"]),
+            help_output,
+        )
+        report.add(
+            "KFS5 mandatory",
+            "Shell help exposes the process management commands",
+            all(token in help_output for token in ["procs", "execdemo", "sched TICKS", "forkdemo PID", "waitproc PID", "killproc PID", "sigproc PID", "getuid PID", "mmapproc PID SIZE", "sockdemo"]),
             help_output,
         )
 
@@ -508,6 +900,165 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             pagedir_output,
         )
 
+        idt_output = clean_output(session.run_command("idt"))
+        report.add(
+            "KFS4 mandatory",
+            "idt command reports the registered descriptor table and interrupt state",
+            all(token in idt_output for token in ["=== IDT ===", "Base: 0x", "Interrupts: enabled", "IRQ1 vector: 0x00000021", "System call vector: 0x00000080"]),
+            idt_output,
+        )
+
+        signals_output = clean_output(session.run_command("signals"))
+        report.add(
+            "KFS4 mandatory",
+            "signals command reports queue and delivery counters",
+            all(token in signals_output for token in ["=== Signals ===", "Pending: 0", "Handled:", "Last signal:", "Last value:"]),
+            signals_output,
+        )
+
+        sigtest_output = clean_output(session.run_command("sigtest"))
+        report.add(
+            "KFS4 mandatory",
+            "Signal callbacks can be scheduled and dispatched from the kernel API",
+            all(token in sigtest_output for token in ["Scheduling test signal...", "[signal] handled signal 1 value=0xC0DE1234", "Signal delivery complete."]),
+            sigtest_output,
+        )
+
+        signals_after_output = clean_output(session.run_command("signals"))
+        report.add(
+            "KFS4 mandatory",
+            "Signal state tracks the delivered test signal",
+            all(token in signals_after_output for token in ["Pending: 0", "Handled: 1", "Last signal: 1", "Last value: 0xC0DE1234"]),
+            signals_after_output,
+        )
+
+        syscall_output = clean_output(session.run_command("syscall"))
+        report.add(
+            "KFS4 bonus",
+            "int 0x80 dispatches through the syscall foundation",
+            "syscall returned 0x4B465334" in syscall_output,
+            syscall_output,
+        )
+
+        procs_output = clean_output(session.run_command("procs"))
+        report.add(
+            "KFS5 mandatory",
+            "The shell can inspect the process table and scheduler state",
+            all(token in procs_output for token in ["=== Process Table ===", "PID=1", "STATE=THREAD", "OWNER=0", "CPU ticks:", "PIT ticks:"]),
+            procs_output,
+        )
+
+        execdemo_output = clean_output(session.run_command("execdemo"))
+        demo_pids = parse_demo_pids(execdemo_output)
+        report.add(
+            "KFS5 mandatory",
+            "exec_fn-style demo processes can be spawned from the shell",
+            len(demo_pids) == 2,
+            execdemo_output,
+        )
+
+        getuid_output = ""
+        forkdemo_output = ""
+        mmap_output = ""
+        sigproc_output = ""
+        procs_signal_queued = ""
+        sched_signal_output = ""
+        procs_signal_delivered = ""
+        killproc_output = ""
+        sched_kill_output = ""
+        wait_child_output = ""
+        sched_demo_output = ""
+        wait_demo_one_output = ""
+        wait_demo_two_output = ""
+
+        child_pid = None
+        if len(demo_pids) == 2:
+            getuid_output = clean_output(session.run_command(f"getuid {demo_pids[0]}"))
+            forkdemo_output = clean_output(session.run_command(f"forkdemo {demo_pids[0]}"))
+            child_pid = parse_fork_child_pid(forkdemo_output)
+
+        report.add(
+            "KFS5 mandatory",
+            "Processes expose an owner id through the getuid helper path",
+            len(demo_pids) == 2 and f"PID {demo_pids[0]} owner=1000" in getuid_output,
+            getuid_output or execdemo_output,
+        )
+
+        report.add(
+            "KFS5 mandatory",
+            "fork creates a new child process record",
+            child_pid is not None,
+            forkdemo_output or execdemo_output,
+        )
+
+        if child_pid is not None:
+            mmap_output = clean_output(session.run_command(f"mmapproc {child_pid} 32"))
+            sigproc_output = clean_output(session.run_command(f"sigproc {child_pid} 16 0xDEADBEEF"))
+            procs_signal_queued = clean_output(session.run_command("procs"))
+            sched_signal_output = clean_output(session.run_command("sched 1"))
+            procs_signal_delivered = clean_output(session.run_command("procs"))
+            killproc_output = clean_output(session.run_command(f"killproc {child_pid} 15"))
+            sched_kill_output = clean_output(session.run_command("sched 1"))
+            wait_child_output = clean_output(session.run_command(f"waitproc {child_pid}"))
+
+        report.add(
+            "KFS5 mandatory",
+            "Per-process memory helpers can reserve memory in a process heap",
+            child_pid is not None and f"for PID {child_pid}" in mmap_output and "mmapproc mapped 0x" in mmap_output,
+            mmap_output or forkdemo_output,
+        )
+
+        report.add(
+            "KFS5 mandatory",
+            "Queued process signals are visible before the next scheduler tick",
+            child_pid is not None
+            and f"Queued process signal 16 for PID {child_pid} value=0xDEADBEEF" in sigproc_output
+            and re.search(fr"PID={child_pid}\b.*SIGQ=1", procs_signal_queued) is not None,
+            (sigproc_output + "\n" + procs_signal_queued).strip(),
+        )
+
+        report.add(
+            "KFS5 mandatory",
+            "Process signals are delivered on the next scheduler tick",
+            child_pid is not None
+            and "Scheduler ran 1 ticks" in sched_signal_output
+            and re.search(fr"PID={child_pid}\b.*LASTSIG=16.*SIGVAL=0xDEADBEEF", procs_signal_delivered) is not None,
+            (sched_signal_output + "\n" + procs_signal_delivered).strip(),
+        )
+
+        report.add(
+            "KFS5 mandatory",
+            "kill and wait helpers can terminate and collect a process",
+            child_pid is not None
+            and f"Queued signal 15 for PID {child_pid}" in killproc_output
+            and "Scheduler ran 1 ticks" in sched_kill_output
+            and f"wait collected PID {child_pid} exit=143" in wait_child_output,
+            (killproc_output + "\n" + sched_kill_output + "\n" + wait_child_output).strip(),
+        )
+
+        if len(demo_pids) == 2:
+            sched_demo_output = clean_output(session.run_command("sched 6"))
+            wait_demo_one_output = clean_output(session.run_command(f"waitproc {demo_pids[0]}"))
+            wait_demo_two_output = clean_output(session.run_command(f"waitproc {demo_pids[1]}"))
+
+        report.add(
+            "KFS5 mandatory",
+            "The multitasking scheduler advances runnable demo processes over CPU ticks",
+            len(demo_pids) == 2
+            and "Scheduler ran 6 ticks" in sched_demo_output
+            and f"wait collected PID {demo_pids[0]} exit=3" in wait_demo_one_output
+            and f"wait collected PID {demo_pids[1]} exit=13" in wait_demo_two_output,
+            (sched_demo_output + "\n" + wait_demo_one_output + "\n" + wait_demo_two_output).strip(),
+        )
+
+        sockdemo_output = clean_output(session.run_command("sockdemo"))
+        report.add(
+            "KFS5 mandatory",
+            "Socket helpers can transfer a value between processes",
+            all(token in sockdemo_output for token in ["Socket demo sender=", "receiver=", "value=0xABCD1234"]),
+            sockdemo_output,
+        )
+
         warning_output = clean_output(session.run_command("alloc 9000000", timeout=15))
         report.add(
             "KFS3 mandatory",
@@ -533,6 +1084,22 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             all(token in panic_output for token in ["Triggering test kernel panic...", "KERNEL PANIC", "The system has been halted."]),
             panic_output,
         )
+        report.add(
+            "KFS4 mandatory",
+            "panic output includes saved register and stack context",
+            all(token in panic_output for token in ["EIP:", "ESP:", "Saved stack pointer:", "Stack snapshot:"]),
+            panic_output,
+        )
+
+    with QemuSession(qemu_binary) as session:
+        session.boot_to_shell()
+        int3_output = clean_output(session.run_until("int3", "The system has been halted.", timeout=10))
+        report.add(
+            "KFS4 mandatory",
+            "Software interrupt and exception handling routes through the IDT panic path",
+            all(token in int3_output for token in ["Triggering breakpoint exception...", "Breakpoint", "KERNEL PANIC", "The system has been halted."]),
+            int3_output,
+        )
 
     with QemuSession(qemu_binary) as session:
         session.boot_to_shell()
@@ -542,7 +1109,7 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
         report.add(
             "KFS2 bonus",
             "reboot restarts the virtual machine back into the kernel",
-            "Rebooting..." in reboot_output and reboot_output.count("Welcome to KFS-3!") >= 1,
+            "Rebooting..." in reboot_output and (reboot_output.count("Welcome to KFS-5!") >= 1 or reboot_output.count("Welcome to KFS-4!") >= 1 or reboot_output.count("Welcome to KFS-3!") >= 1),
             reboot_output,
         )
 
@@ -582,7 +1149,7 @@ def find_qemu(report: Reporter) -> str | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Static and runtime checks for KFS-2 and KFS-3")
+    parser = argparse.ArgumentParser(description="Static and runtime checks for KFS-2, KFS-3, KFS-4, and KFS-5")
     parser.add_argument("--skip-build", action="store_true", help="Assume kernel.bin is already up to date")
     parser.add_argument("--skip-runtime", action="store_true", help="Run only static checks")
     args = parser.parse_args()

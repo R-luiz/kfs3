@@ -3,12 +3,17 @@
 #include "keyboard.h"
 #include "serial.h"
 #include "gdt.h"
+#include "idt.h"
 #include "shell.h"
 #include "multiboot.h"
 #include "pmm.h"
 #include "paging.h"
 #include "kmalloc.h"
 #include "vmalloc.h"
+#include "signals.h"
+#include "syscall.h"
+#include "process.h"
+#include "timer.h"
 #include "panic.h"
 
 static uint16_t* const VGA_MEMORY = (uint16_t*)0xB8000;
@@ -347,8 +352,8 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
 
     terminal_color = vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
-    terminal_write("\nWelcome to KFS-3!\n");
-    terminal_write("42 School Kernel From Scratch - v3.0\n\n");
+    terminal_write("\nWelcome to KFS-5!\n");
+    terminal_write("42 School Kernel From Scratch - v5.0\n\n");
 
     /* Verify multiboot magic */
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
@@ -357,6 +362,18 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
 
     /* Store multiboot info globally */
     g_multiboot_info = mbi;
+
+    terminal_write("Initializing Interrupt Descriptor Table...\n");
+    idt_init();
+    terminal_write("  IDT ready (PIC remapped)\n");
+
+    terminal_write("Initializing Signal Callback Interface...\n");
+    signals_init();
+    terminal_write("  Signal scheduler ready\n");
+
+    terminal_write("Initializing Syscall Interface...\n");
+    syscall_init();
+    terminal_write("  int 0x80 handler ready\n");
 
     /* Initialize Physical Memory Manager */
     terminal_write("Initializing Physical Memory Manager...\n");
@@ -384,6 +401,15 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
     vmalloc_init();
     terminal_write("  VMalloc ready\n");
 
+    terminal_write("Initializing Process Interface...\n");
+    process_init();
+    terminal_write("  Kernel process ready\n");
+
+    terminal_write("Initializing Multitasking Scheduler...\n");
+    scheduler_init();
+    timer_init(50);
+    terminal_write("  Scheduler and CPU tick ready\n");
+
     terminal_write("\nMemory initialization complete!\n");
 
     terminal_write("Printing kernel stack info:\n");
@@ -391,17 +417,24 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
 
     terminal_write("\nPress any key to continue...");
 
-    /* Initialize the keyboard */
+    terminal_write("Initializing IDT keyboard handling...\n");
     init_keyboard();
+    terminal_write("  Keyboard IRQ1 ready\n");
+
+    terminal_write("Enabling interrupts...\n");
+    idt_enable_interrupts();
+    terminal_write("  Interrupts enabled\n");
 
     /* Wait for keyboard or serial input */
-    while (!(inb(KEYBOARD_STATUS_PORT) & 0x01) && !serial_has_data())
-        ;
+    while (!keyboard_has_char() && !serial_has_data()) {
+        signal_dispatch_pending();
+        scheduler_run_pending(1);
+    }
 
     if (serial_has_data()) {
         serial_read_char();
     } else {
-        inb(KEYBOARD_DATA_PORT);  /* Consume the key */
+        keyboard_getchar();
     }
 
     /* Clear screen and show header for shell */
@@ -414,10 +447,6 @@ void kernel_main(uint32_t magic, multiboot_info_t *mbi)
 
     /* Shell exited - halt the system */
     terminal_write("\n\nSystem halted.\n");
-
-    /* Disable interrupts and halt CPU */
-    asm volatile("cli");
-    while (1) {
-        asm volatile("hlt");
-    }
+    panic_save_context(NULL);
+    panic_clean_registers_and_halt();
 }

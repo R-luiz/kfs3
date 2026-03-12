@@ -1,5 +1,5 @@
 #include "serial.h"
-#include "keyboard.h"
+#include "io.h"
 
 #define SERIAL_COM1                     0x3F8
 #define SERIAL_DATA_PORT                (SERIAL_COM1 + 0)

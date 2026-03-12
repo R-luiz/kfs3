@@ -1,15 +1,23 @@
-# KFS-3: Memory Management
+# KFS-5: Processes, Interrupts, and Memory Management
 
-42 School - Kernel From Scratch, Third Subject
+42 School - Kernel From Scratch, Fifth Subject
 
 ## Overview
 
-KFS-3 implements a complete memory management system for a bare-metal i386 kernel, including:
+This kernel now covers the KFS-2, KFS-3, KFS-4, and KFS-5 milestones for a bare-metal i386 kernel, including:
 
 - **Memory Paging** - Virtual to physical address translation
 - **Physical Memory Manager (PMM)** - Bitmap-based page frame allocator
 - **Kernel Heap** - `kmalloc`/`kfree` implementation
 - **Virtual Memory Allocator** - `vmalloc`/`vfree` implementation
+- **Interrupt Descriptor Table (IDT)** - CPU exception, IRQ, and software interrupt dispatch
+- **Signal Callback System** - Kernel signal registration, scheduling, and delivery
+- **Interrupt-Driven Keyboard** - IRQ1-backed keyboard buffering with `get_line()` foundation
+- **Syscall Foundation** - `int 0x80` entry point and syscall table scaffold
+- **Process Interface** - PID/state/owner/kinship tracking with per-process memory metadata
+- **Multitasking Scheduler** - IRQ0/PIT-driven tick scheduler for in-kernel process demos
+- **Process IPC** - Simple socket-style queued message passing between processes
+- **exec_fn Process Demos** - Run kernel functions as scheduled processes to prove the API
 - **Kernel Panic Handler** - Error handling with visual feedback
 - **Interactive Shell** - With memory debugging commands
 - **VGA Terminal** - With scrolling, hardware cursor, and backspace support
@@ -42,7 +50,25 @@ KFS-3 implements a complete memory management system for a bare-metal i386 kerne
 ### Kernel Panic
 - Fatal panics (red screen, system halt)
 - Non-fatal warnings (continue execution)
+- Register snapshot capture on panic
+- Stack snapshot capture before halt
+- Register cleanup before halt
 - Assert macros for debugging
+
+### Interrupts and Signals
+- PIC remapping and IDT registration
+- CPU exception handlers through a shared interrupt path
+- IRQ1 keyboard handler feeding a kernel input buffer
+- Signal callback registration and queued delivery
+- Software interrupt foundation via `int 0x80`
+
+### Processes and Scheduling
+- `process_t` records PID, owner, parent/children, state, signals, stack, heap, and address-space metadata
+- Dedicated per-process mapped pages for data, BSS, heap, and stack
+- Round-robin scheduler driven by the PIT on IRQ0
+- `fork`, `wait`, `_exit`, `getuid`, `signal`, and `kill` helper paths registered in the syscall layer
+- Socket-style IPC queue between processes
+- `exec_fn` process execution path for in-kernel demo workloads
 
 ## Requirements
 
@@ -67,7 +93,7 @@ sudo apt install gcc nasm qemu-system-x86 gcc-multilib
 ```bash
 make        # Build the kernel
 make run    # Run in QEMU (auto-falls back to headless serial if no GUI backend exists)
-make test-kfs  # Run the automated KFS-2/KFS-3 test suite
+make test-kfs  # Run the automated KFS-2/KFS-3/KFS-4/KFS-5 test suite
 ```
 
 ### All Make Targets
@@ -75,7 +101,7 @@ make test-kfs  # Run the automated KFS-2/KFS-3 test suite
 |---------|-------------|
 | `make` | Build kernel.bin |
 | `make run` | Build and run in QEMU (GUI when available, otherwise headless serial) |
-| `make test-kfs` | Run static + runtime checks for KFS-2 and KFS-3 |
+| `make test-kfs` | Run static + runtime checks for KFS-2, KFS-3, KFS-4, and KFS-5 |
 | `make image` | Create bootable disk image (os.img) |
 | `make run-image` | Run from disk image (requires GRUB) |
 | `make clean` | Remove build artifacts |
@@ -99,7 +125,7 @@ When QEMU has no graphical display backend, the kernel mirrors console output to
 python3 tools/test_kfs.py
 ```
 
-The test script mixes static checks with headless QEMU runtime checks. It verifies the KFS-2 GDT and stack requirements, KFS-3 memory and panic requirements, and the shell/debug bonus surface that is currently implemented in this repository.
+The test script mixes static checks with headless QEMU runtime checks. It verifies the KFS-2 GDT and stack requirements, KFS-3 memory and panic requirements, the KFS-4 interrupt stack, and the KFS-5 process subsystem: process tables, scheduler ticks, `exec_fn`, `fork`, `wait`, `kill`, `getuid`, per-process memory helpers, and socket IPC.
 
 ## Usage
 
@@ -156,6 +182,10 @@ Triggering test kernel panic...
 
 The `panic` command will show a red kernel panic screen and halt the system.
 
+The `int3` command triggers a breakpoint exception through the IDT, and `sigtest` exercises the in-kernel signal scheduling path.
+
+The `execdemo`, `sched`, `forkdemo`, `waitproc`, `killproc`, `sigproc`, `getuid`, `mmapproc`, and `sockdemo` commands exercise the KFS-5 process layer directly inside the kernel.
+
 ### Debug Session Example
 ```
 shell> hexdump 0xb8000 32
@@ -211,7 +241,26 @@ Mapped page tables:
 | `poke ADDR VALUE` | Write 32-bit VALUE to memory address |
 | `stack` | Dump current stack (ESP, EBP, 64 bytes of stack) |
 | `pagedir` | Show page directory entries with permissions |
+| `idt` | Show the current IDT base/limit and interrupt state |
+| `signals` | Show queued and delivered kernel signal state |
+| `sigtest` | Register a test signal callback and dispatch a queued signal |
+| `syscall` | Trigger the `int 0x80` syscall foundation and print the return value |
+| `int3` | Trigger a breakpoint exception through the IDT |
 | `panic` | Trigger test kernel panic |
+
+### Process Commands
+| Command | Description |
+|---------|-------------|
+| `procs` | Show the process table, scheduler ticks, and per-process state |
+| `execdemo` | Spawn two demo processes through the `exec_fn` path |
+| `sched TICKS` | Force the scheduler to consume a number of CPU ticks |
+| `forkdemo PID` | Fork an existing process and create a child copy |
+| `waitproc PID` | Collect a zombie process and print its exit code |
+| `killproc PID [SIG]` | Queue a signal, defaulting to `SIGTERM`, for a process |
+| `sigproc PID SIG [VAL]` | Queue an arbitrary process signal to be delivered on the next tick |
+| `getuid PID` | Show the owner id of a process |
+| `mmapproc PID SIZE` | Reserve space in a process heap via the KFS-5 memory helpers |
+| `sockdemo` | Spawn a sender/receiver pair and validate socket-style IPC |
 
 ## Project Structure
 
@@ -225,23 +274,35 @@ kfs3/
 │   │   ├── types.h       # Basic type definitions
 │   │   ├── vga.h         # VGA text mode
 │   │   ├── gdt.h         # Global Descriptor Table
+│   │   ├── idt.h         # Interrupt Descriptor Table and PIC
+│   │   ├── io.h          # Port I/O and interrupt helpers
 │   │   ├── keyboard.h    # Keyboard I/O
 │   │   ├── shell.h       # Shell interface
 │   │   ├── multiboot.h   # Multiboot structures
 │   │   ├── pmm.h         # Physical Memory Manager
 │   │   ├── paging.h      # Paging structures
 │   │   ├── kmalloc.h     # Kernel heap
+│   │   ├── signals.h     # Kernel signal API
+│   │   ├── syscall.h     # Syscall foundation
+│   │   ├── process.h     # Process, scheduler, IPC, and exec_fn interfaces
+│   │   ├── timer.h       # PIT timer and CPU tick helpers
 │   │   ├── vmalloc.h     # Virtual memory
 │   │   └── panic.h       # Panic handler
 │   └── src/
 │       ├── main.c        # Kernel entry point
+│       ├── timer.c       # PIT IRQ0 setup
+│       ├── process.c     # Process manager, scheduler, IPC, and demos
 │       ├── gdt.c         # GDT initialization
-│       ├── keyboard.c    # Keyboard driver
+│       ├── interrupts.asm # ISR/IRQ assembly stubs
+│       ├── idt.c         # IDT and PIC initialization
+│       ├── keyboard.c    # Interrupt-driven keyboard driver
 │       ├── shell.c       # Interactive shell
 │       ├── panic.c       # Panic implementation
 │       ├── pmm.c         # PMM implementation
 │       ├── paging.c      # Paging implementation
 │       ├── kmalloc.c     # Heap allocator
+│       ├── signals.c     # Signal queue and callbacks
+│       ├── syscall.c     # Syscall dispatch scaffold
 │       └── vmalloc.c     # VMalloc implementation
 ├── tools/
 │   └── create_image.sh   # Bootable image script

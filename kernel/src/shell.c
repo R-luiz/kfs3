@@ -3,22 +3,18 @@
 #include "keyboard.h"
 #include "serial.h"
 #include "types.h"
+#include "idt.h"
 #include "pmm.h"
 #include "kmalloc.h"
 #include "vmalloc.h"
 #include "paging.h"
+#include "signals.h"
+#include "syscall.h"
+#include "process.h"
+#include "timer.h"
 #include "panic.h"
 
 #define SHELL_BUFFER_SIZE 256
-
-// Simple scancode-to-ASCII mapping (same as before)
-static const char scancode_to_ascii[] = {
-    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-    '*', 0, ' '
-};
 
 /* External terminal routines that are now public (see main.c modifications) */
 extern void terminal_putchar(char c);
@@ -187,12 +183,84 @@ static void shell_dump_stack(void) {
 /* Store last kmalloc allocation for free testing */
 static void *last_alloc = NULL;
 static size_t last_alloc_size = 0;
+static int shell_signal_handler_installed = 0;
+static int shell_last_signal = 0;
+static uint32_t shell_last_signal_value = 0;
+static uint32_t shell_signal_count = 0;
+static uint32_t shell_last_demo_pid = 0;
+
+static char *skip_spaces(char *text)
+{
+    while (*text == ' ') {
+        text++;
+    }
+    return text;
+}
+
+static void shell_print_process_summary(process_t *process)
+{
+    uint32_t parent_pid = process->parent != NULL ? process->parent->pid : 0;
+
+    terminal_write("PID=");
+    shell_print_dec(process->pid);
+    terminal_write(" STATE=");
+    terminal_write(process_status_name(process->status));
+    terminal_write(" OWNER=");
+    shell_print_dec(process->owner);
+    terminal_write(" PARENT=");
+    shell_print_dec(parent_pid);
+    terminal_write(" RUNS=");
+    shell_print_dec(process->run_count);
+    terminal_write(" TICKS=");
+    shell_print_dec(process->cpu_ticks);
+    terminal_write(" SIGQ=");
+    shell_print_dec(process_signal_pending_count(process));
+    terminal_write(" SOCKQ=");
+    shell_print_dec(process_socket_pending_count(process));
+    terminal_write(" PAGE=");
+    shell_print_hex(process->memory.process_page);
+    terminal_write(" HEAP=");
+    shell_print_hex(process->memory.heap_start);
+    terminal_write(" STACK=");
+    shell_print_hex(process->memory.stack_top);
+    terminal_write(" LASTSIG=");
+    shell_print_dec(process->last_signal);
+    terminal_write(" SIGVAL=");
+    shell_print_hex(process->last_signal_value);
+    terminal_write(" LASTVAL=");
+    shell_print_hex(process->runtime_value);
+    if (process->status == PROCESS_STATUS_ZOMBIE) {
+        terminal_write(" EXIT=");
+        shell_print_dec((uint32_t)process->exit_code);
+    }
+    terminal_write("\n");
+}
+
+static void shell_signal_handler(int signal, uint32_t value, void *context)
+{
+    (void)context;
+
+    shell_last_signal = signal;
+    shell_last_signal_value = value;
+    shell_signal_count++;
+
+    terminal_write("[signal] handled signal ");
+    shell_print_dec((uint32_t)signal);
+    terminal_write(" value=");
+    shell_print_hex(value);
+    terminal_write("\n");
+}
 
 /*
- * shell_getchar: busy-polls the keyboard until a key press is detected.
+ * shell_getchar: reads shell input from serial or the keyboard IRQ buffer.
  */
 static char shell_getchar(void) {
     while (1) {
+        char keyboard_char;
+
+        signal_dispatch_pending();
+        scheduler_run_pending(1);
+
         if (serial_has_data()) {
             char c = serial_read_char();
 
@@ -207,18 +275,8 @@ static char shell_getchar(void) {
             }
         }
 
-        if (inb(KEYBOARD_STATUS_PORT) & 0x01) {
-            uint8_t scancode = inb(KEYBOARD_DATA_PORT);
-            /* Only process key press events (ignore releases) */
-            if (scancode < sizeof(scancode_to_ascii) && !(scancode & 0x80)) {
-                char c = scancode_to_ascii[scancode];
-                /* Wait until the key is released to avoid autorepeat issues */
-                while (inb(KEYBOARD_STATUS_PORT) & 0x01)
-                    inb(KEYBOARD_DATA_PORT);
-                /* Only return valid characters, ignore unmapped keys */
-                if (c != 0)
-                    return c;
-            }
+        if (keyboard_try_read_char(&keyboard_char)) {
+            return keyboard_char;
         }
     }
 }
@@ -287,7 +345,23 @@ void shell_run(void) {
             terminal_write("  poke ADDR VAL - Write 32-bit value to address\n");
             terminal_write("  stack         - Dump current stack\n");
             terminal_write("  pagedir       - Show page directory info\n");
+            terminal_write("  idt           - Show IDT and interrupt state\n");
+            terminal_write("  signals       - Show signal queue state\n");
+            terminal_write("  sigtest       - Schedule and handle a test signal\n");
+            terminal_write("  syscall       - Trigger int 0x80 test syscall\n");
+            terminal_write("  int3          - Trigger a breakpoint exception\n");
             terminal_write("  panic         - Trigger test kernel panic\n");
+            terminal_write("\nProcess commands:\n");
+            terminal_write("  procs         - Show the process table\n");
+            terminal_write("  execdemo      - Spawn demo counter processes\n");
+            terminal_write("  sched TICKS   - Force scheduler ticks\n");
+            terminal_write("  forkdemo PID  - Fork a process\n");
+            terminal_write("  waitproc PID  - Collect a zombie child\n");
+            terminal_write("  killproc PID [SIG] - Queue a signal or kill a process\n");
+            terminal_write("  sigproc PID SIG [VAL] - Queue a process signal\n");
+            terminal_write("  getuid PID    - Show the owner of a process\n");
+            terminal_write("  mmapproc PID SIZE - Reserve memory in a process heap\n");
+            terminal_write("  sockdemo      - Spawn a socket IPC demo pair\n");
         } else if (strncmp(buffer, "echo ", 5) == 0) {
             terminal_write(buffer + 5);
             terminal_putchar('\n');
@@ -501,6 +575,259 @@ void shell_run(void) {
                 }
             }
         }
+        else if (strcmp(buffer, "idt") == 0) {
+            uint32_t base;
+            uint16_t limit;
+
+            idt_get_descriptor(&base, &limit);
+            terminal_write("=== IDT ===\n");
+            terminal_write("Base: ");
+            shell_print_hex(base);
+            terminal_write("\nLimit: ");
+            shell_print_dec(limit);
+            terminal_write(" bytes\nInterrupts: ");
+            terminal_write(idt_interrupts_enabled() ? "enabled" : "disabled");
+            terminal_write("\nIRQ1 vector: 0x00000021\nSystem call vector: 0x00000080\n");
+        }
+        else if (strcmp(buffer, "signals") == 0) {
+            terminal_write("=== Signals ===\n");
+            terminal_write("Pending: ");
+            shell_print_dec(signal_pending_count());
+            terminal_write("\nHandled: ");
+            shell_print_dec(shell_signal_count);
+            terminal_write("\nLast signal: ");
+            shell_print_dec((uint32_t)shell_last_signal);
+            terminal_write("\nLast value: ");
+            shell_print_hex(shell_last_signal_value);
+            terminal_write("\n");
+        }
+        else if (strcmp(buffer, "sigtest") == 0) {
+            if (!shell_signal_handler_installed) {
+                register_signal_handler(KERNEL_SIGNAL_TEST, shell_signal_handler);
+                shell_signal_handler_installed = 1;
+            }
+
+            terminal_write("Scheduling test signal...\n");
+            if (schedule_signal(KERNEL_SIGNAL_TEST, 0xC0DE1234, NULL) == 0) {
+                signal_dispatch_pending();
+                terminal_write("Signal delivery complete.\n");
+            } else {
+                terminal_write("Signal queue is full.\n");
+            }
+        }
+        else if (strcmp(buffer, "syscall") == 0) {
+            uint32_t result;
+
+            asm volatile ("int $0x80" : "=a"(result) : "a"(SYSCALL_GET_MAGIC), "b"(0), "c"(0), "d"(0), "S"(0) : "memory");
+            terminal_write("syscall returned ");
+            shell_print_hex(result);
+            terminal_write("\n");
+        }
+        else if (strcmp(buffer, "procs") == 0) {
+            process_t *process = process_first();
+
+            terminal_write("=== Process Table ===\n");
+            terminal_write("Total: ");
+            shell_print_dec(process_count());
+            terminal_write("  CPU ticks: ");
+            shell_print_dec(scheduler_tick_count());
+            terminal_write("  PIT ticks: ");
+            shell_print_dec(timer_get_ticks());
+            terminal_write("\n");
+
+            while (process != NULL) {
+                shell_print_process_summary(process);
+                process = process->next;
+            }
+        }
+        else if (strcmp(buffer, "execdemo") == 0) {
+            process_t *first = process_spawn_demo_counter(1000, 0, 3);
+            process_t *second = process_spawn_demo_counter(1001, 10, 13);
+
+            if (first == NULL || second == NULL) {
+                terminal_write("Failed to create demo processes\n");
+            } else {
+                shell_last_demo_pid = second->pid;
+                terminal_write("Created demo processes: ");
+                shell_print_dec(first->pid);
+                terminal_write(", ");
+                shell_print_dec(second->pid);
+                terminal_write("\n");
+            }
+        }
+        else if (strncmp(buffer, "sched ", 6) == 0) {
+            uint32_t ticks = parse_uint(buffer + 6);
+
+            if (ticks == 0) {
+                terminal_write("Usage: sched TICKS\n");
+            } else {
+                scheduler_force_ticks(ticks);
+                terminal_write("Scheduler ran ");
+                shell_print_dec(ticks);
+                terminal_write(" ticks (total ");
+                shell_print_dec(scheduler_tick_count());
+                terminal_write(")\n");
+            }
+        }
+        else if (strncmp(buffer, "forkdemo", 8) == 0) {
+            char *args = skip_spaces(buffer + 8);
+            uint32_t pid = *args != '\0' ? parse_uint(args) : shell_last_demo_pid;
+            process_t *source = process_get_by_pid(pid);
+            process_t *child;
+
+            if (source == NULL) {
+                terminal_write("Usage: forkdemo PID\n");
+            } else {
+                child = fork_process(source);
+                if (child == NULL) {
+                    terminal_write("Fork failed\n");
+                } else {
+                    terminal_write("Forked PID ");
+                    shell_print_dec(pid);
+                    terminal_write(" -> child PID ");
+                    shell_print_dec(child->pid);
+                    terminal_write("\n");
+                }
+            }
+        }
+        else if (strncmp(buffer, "waitproc ", 9) == 0) {
+            uint32_t pid = parse_uint(buffer + 9);
+            int exit_code = 0;
+            int result = process_wait(process_root(), pid, &exit_code);
+
+            if (result < 0) {
+                terminal_write("waitproc: invalid child pid\n");
+            } else if (result == 0) {
+                terminal_write("waitproc: process still running\n");
+            } else {
+                terminal_write("wait collected PID ");
+                shell_print_dec(pid);
+                terminal_write(" exit=");
+                shell_print_dec((uint32_t)exit_code);
+                terminal_write("\n");
+            }
+        }
+        else if (strncmp(buffer, "killproc ", 9) == 0) {
+            char *args = buffer + 9;
+            uint32_t pid = parse_uint(args);
+            int signal = PROCESS_SIGNAL_TERM;
+
+            while (*args && *args != ' ') args++;
+            if (*args == ' ') {
+                args = skip_spaces(args);
+                signal = (int)parse_uint(args);
+            }
+
+            if (kill_process(process_root(), pid, signal) == 0) {
+                terminal_write("Queued signal ");
+                shell_print_dec((uint32_t)signal);
+                terminal_write(" for PID ");
+                shell_print_dec(pid);
+                terminal_write("\n");
+            } else {
+                terminal_write("killproc failed\n");
+            }
+        }
+        else if (strncmp(buffer, "sigproc ", 8) == 0) {
+            char *args = buffer + 8;
+            uint32_t pid = parse_uint(args);
+            int signal;
+            uint32_t value = 0;
+
+            while (*args && *args != ' ') args++;
+            if (*args != ' ') {
+                terminal_write("Usage: sigproc PID SIG [VAL]\n");
+            } else {
+                args = skip_spaces(args);
+                signal = (int)parse_uint(args);
+                while (*args && *args != ' ') args++;
+                if (*args == ' ') {
+                    args = skip_spaces(args);
+                    value = parse_hex(args);
+                }
+
+                if (send_signal_to_process(process_root(), pid, signal, value) == 0) {
+                    terminal_write("Queued process signal ");
+                    shell_print_dec((uint32_t)signal);
+                    terminal_write(" for PID ");
+                    shell_print_dec(pid);
+                    terminal_write(" value=");
+                    shell_print_hex(value);
+                    terminal_write("\n");
+                } else {
+                    terminal_write("sigproc failed\n");
+                }
+            }
+        }
+        else if (strncmp(buffer, "getuid ", 7) == 0) {
+            uint32_t pid = parse_uint(buffer + 7);
+            process_t *process = process_get_by_pid(pid);
+
+            if (process == NULL) {
+                terminal_write("getuid: invalid pid\n");
+            } else {
+                terminal_write("PID ");
+                shell_print_dec(pid);
+                terminal_write(" owner=");
+                shell_print_dec(process_getuid(process));
+                terminal_write("\n");
+            }
+        }
+        else if (strncmp(buffer, "mmapproc ", 9) == 0) {
+            char *args = buffer + 9;
+            uint32_t pid = parse_uint(args);
+            process_t *process;
+            void *mapped;
+
+            while (*args && *args != ' ') args++;
+            if (*args != ' ') {
+                terminal_write("Usage: mmapproc PID SIZE\n");
+            } else {
+                args = skip_spaces(args);
+                process = process_get_by_pid(pid);
+                if (process == NULL) {
+                    terminal_write("mmapproc: invalid pid\n");
+                } else {
+                    mapped = process_mmap(process, parse_uint(args));
+                    if (mapped == NULL) {
+                        terminal_write("mmapproc failed\n");
+                    } else {
+                        terminal_write("mmapproc mapped ");
+                        shell_print_hex((uint32_t)mapped);
+                        terminal_write(" for PID ");
+                        shell_print_dec(pid);
+                        terminal_write("\n");
+                    }
+                }
+            }
+        }
+        else if (strcmp(buffer, "sockdemo") == 0) {
+            uint32_t sender_pid = 0;
+            uint32_t receiver_pid = 0;
+            process_t *receiver;
+
+            if (process_spawn_demo_socket_pair(2000, 0xABCD1234, &sender_pid, &receiver_pid) != 0) {
+                terminal_write("Socket demo setup failed\n");
+            } else {
+                scheduler_force_ticks(4);
+                receiver = process_get_by_pid(receiver_pid);
+                terminal_write("Socket demo sender=");
+                shell_print_dec(sender_pid);
+                terminal_write(" receiver=");
+                shell_print_dec(receiver_pid);
+                terminal_write(" value=");
+                if (receiver != NULL) {
+                    shell_print_hex(receiver->last_socket_value);
+                } else {
+                    terminal_write("0x00000000");
+                }
+                terminal_write("\n");
+            }
+        }
+        else if (strcmp(buffer, "int3") == 0) {
+            terminal_write("Triggering breakpoint exception...\n");
+            asm volatile ("int3");
+        }
         /* Reboot command */
         else if (strcmp(buffer, "reboot") == 0) {
             terminal_write("Rebooting...\n");
@@ -512,5 +839,7 @@ void shell_run(void) {
         } else if (buffer[0] != '\0') {
             terminal_write("Command not found. Type 'help' for commands.\n");
         }
+
+        scheduler_run_pending(2);
     }
 }

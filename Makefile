@@ -26,7 +26,13 @@ LDFLAGS = -m elf_i386 -T boot/linker.ld -nostdlib
 # Source files
 KERNEL_OBJS = boot/boot.o \
               kernel/src/main.o \
+			  kernel/src/timer.o \
+			  kernel/src/process.o \
+			  kernel/src/interrupts.o \
+			  kernel/src/idt.o \
               kernel/src/keyboard.o \
+			  kernel/src/signals.o \
+			  kernel/src/syscall.o \
 			  kernel/src/serial.o \
               kernel/src/gdt.o \
               kernel/src/shell.o \
