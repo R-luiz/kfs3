@@ -209,7 +209,6 @@ static void process_default_signal_handler(process_t *process, int signal, uint3
 {
     process->last_signal = (uint32_t)signal;
     process->last_signal_value = value;
-    process->runtime_value = value;
 
     if (signal == PROCESS_SIGNAL_TERM || signal == PROCESS_SIGNAL_KILL) {
         process_exit(process, 128 + signal);
@@ -783,6 +782,9 @@ int wait_process(process_t *parent, uint32_t pid, int *exit_code)
 void process_exit(process_t *process, int exit_code)
 {
     if (process == NULL || process == kernel_process) {
+        return;
+    }
+    if (process->status == PROCESS_STATUS_ZOMBIE) {
         return;
     }
 

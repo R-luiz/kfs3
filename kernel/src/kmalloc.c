@@ -65,6 +65,10 @@ void kmalloc_init(void)
     /* Set max heap to 8MB after start (within our identity-mapped region) */
     heap_max = heap_start + (8 * 1024 * 1024);
 
+    /* Reserve the heap range in PMM so pmm_alloc_frame() never returns
+       frames within the heap area (prevents vmalloc from corrupting heap) */
+    pmm_mark_region_used(heap_start, heap_max - heap_start);
+
     block_list = NULL;
     total_allocations = 0;
     total_frees = 0;

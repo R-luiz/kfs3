@@ -257,6 +257,27 @@ static void shell_signal_handler(int signal, uint32_t value, void *context)
     terminal_write("\n");
 }
 
+/* Exception test handlers for div0/invop commands */
+static volatile int exception_test_caught = 0;
+static volatile uint32_t exception_test_vector = 0;
+static volatile uint32_t exception_test_eip = 0;
+
+static void div0_test_handler(cpu_registers_t *regs)
+{
+    exception_test_caught = 1;
+    exception_test_vector = regs->int_no;
+    exception_test_eip = regs->eip;
+    regs->eip += 2; /* skip div %%ecx (F7 F1 = 2 bytes) */
+}
+
+static void invop_test_handler(cpu_registers_t *regs)
+{
+    exception_test_caught = 1;
+    exception_test_vector = regs->int_no;
+    exception_test_eip = regs->eip;
+    regs->eip += 2; /* skip ud2 (0F 0B = 2 bytes) */
+}
+
 /*
  * shell_getchar: reads shell input from serial or the keyboard IRQ buffer.
  */
@@ -345,6 +366,12 @@ void shell_run(void) {
             terminal_write("  free          - Free last allocation\n");
             terminal_write("  kheap         - Dump kernel heap state\n");
             terminal_write("  vmap          - Show virtual memory info\n");
+            terminal_write("\nMemory tests:\n");
+            terminal_write("  pagetest      - Test page map/write/unmap round-trip\n");
+            terminal_write("  pageperm      - Test page permission flags\n");
+            terminal_write("  pmmtest       - Test PMM frame alloc/free accounting\n");
+            terminal_write("  vmtest        - Test vmalloc alloc/write/free\n");
+            terminal_write("  heaptest      - Test heap multi-alloc/free with reuse\n");
             terminal_write("\nDebug commands:\n");
             terminal_write("  hexdump ADDR [SIZE] - Dump memory (default 64 bytes)\n");
             terminal_write("  peek ADDR     - Read 32-bit value at address\n");
@@ -357,6 +384,9 @@ void shell_run(void) {
             terminal_write("  syscall       - Trigger int 0x80 test syscall\n");
             terminal_write("  int3          - Trigger a breakpoint exception\n");
             terminal_write("  panic         - Trigger test kernel panic\n");
+            terminal_write("  div0          - Test division by zero exception\n");
+            terminal_write("  invop         - Test invalid opcode exception\n");
+            terminal_write("  segreg        - Show segment registers\n");
             terminal_write("\nProcess commands:\n");
             terminal_write("  procs         - Show the process table\n");
             terminal_write("  execdemo      - Spawn demo counter processes\n");
@@ -831,6 +861,306 @@ void shell_run(void) {
                 }
                 terminal_write("\n");
             }
+        }
+        /* --- Memory test commands --- */
+        else if (strcmp(buffer, "pagetest") == 0) {
+            uint32_t test_vaddr = 0x40000000;
+            uint32_t frame = pmm_alloc_frame();
+            if (frame == 0) {
+                terminal_write("pagetest: FAIL (no free frames)\n");
+            } else {
+                uint32_t readback;
+                terminal_write("pagetest: alloc frame=");
+                shell_print_hex(frame);
+                terminal_write("\n");
+
+                paging_map_page(test_vaddr, frame, PAGE_KERNEL);
+                terminal_write("pagetest: mapped VA=");
+                shell_print_hex(test_vaddr);
+                terminal_write(" -> PA=");
+                shell_print_hex(frame);
+                terminal_write("\n");
+
+                volatile uint32_t *ptr = (volatile uint32_t *)test_vaddr;
+                *ptr = 0xCAFE4242;
+                terminal_write("pagetest: write 0xCAFE4242 OK\n");
+
+                readback = *ptr;
+                terminal_write("pagetest: read ");
+                shell_print_hex(readback);
+                terminal_write(readback == 0xCAFE4242 ? " OK\npagetest: match OK\n" : " FAIL\n");
+
+                paging_unmap_page(test_vaddr);
+                terminal_write("pagetest: unmapped VA=");
+                shell_print_hex(test_vaddr);
+                terminal_write("\n");
+
+                pmm_free_frame(frame);
+                terminal_write("pagetest: freed frame\n");
+
+                terminal_write(readback == 0xCAFE4242 ? "pagetest: PASS\n" : "pagetest: FAIL\n");
+            }
+        }
+        else if (strcmp(buffer, "pageperm") == 0) {
+            uint32_t test_vaddr = 0x40000000;
+            uint32_t frame = pmm_alloc_frame();
+            if (frame == 0) {
+                terminal_write("pageperm: FAIL (no free frames)\n");
+            } else {
+                page_directory_t *pd = paging_get_directory();
+                uint32_t dir_idx = PAGE_DIR_INDEX(test_vaddr);
+                uint32_t tbl_idx = PAGE_TABLE_INDEX(test_vaddr);
+                page_table_t *table;
+                uint32_t pte;
+                int p, w, u, pass = 1;
+
+                /* Test PAGE_KERNEL (Present, Write, not User) */
+                paging_map_page(test_vaddr, frame, PAGE_KERNEL);
+                table = (page_table_t *)PAGE_FRAME(pd->entries[dir_idx]);
+                pte = table->entries[tbl_idx];
+                p = (pte & PAGE_PRESENT) ? 1 : 0;
+                w = (pte & PAGE_WRITE) ? 1 : 0;
+                u = (pte & PAGE_USER) ? 1 : 0;
+                terminal_write("pageperm: KERNEL -> P=");
+                shell_print_dec(p);
+                terminal_write(" W=");
+                shell_print_dec(w);
+                terminal_write(" U=");
+                shell_print_dec(u);
+                if (p == 1 && w == 1 && u == 0) {
+                    terminal_write(" OK\n");
+                } else { terminal_write(" FAIL\n"); pass = 0; }
+
+                /* Test PAGE_USER_RO */
+                paging_map_page(test_vaddr, frame, PAGE_USER_RO);
+                table = (page_table_t *)PAGE_FRAME(pd->entries[dir_idx]);
+                pte = table->entries[tbl_idx];
+                p = (pte & PAGE_PRESENT) ? 1 : 0;
+                w = (pte & PAGE_WRITE) ? 1 : 0;
+                u = (pte & PAGE_USER) ? 1 : 0;
+                terminal_write("pageperm: USER_RO -> P=");
+                shell_print_dec(p);
+                terminal_write(" W=");
+                shell_print_dec(w);
+                terminal_write(" U=");
+                shell_print_dec(u);
+                if (p == 1 && w == 0 && u == 1) {
+                    terminal_write(" OK\n");
+                } else { terminal_write(" FAIL\n"); pass = 0; }
+
+                /* Test PAGE_USER_RW */
+                paging_map_page(test_vaddr, frame, PAGE_USER_RW);
+                table = (page_table_t *)PAGE_FRAME(pd->entries[dir_idx]);
+                pte = table->entries[tbl_idx];
+                p = (pte & PAGE_PRESENT) ? 1 : 0;
+                w = (pte & PAGE_WRITE) ? 1 : 0;
+                u = (pte & PAGE_USER) ? 1 : 0;
+                terminal_write("pageperm: USER_RW -> P=");
+                shell_print_dec(p);
+                terminal_write(" W=");
+                shell_print_dec(w);
+                terminal_write(" U=");
+                shell_print_dec(u);
+                if (p == 1 && w == 1 && u == 1) {
+                    terminal_write(" OK\n");
+                } else { terminal_write(" FAIL\n"); pass = 0; }
+
+                paging_unmap_page(test_vaddr);
+                pmm_free_frame(frame);
+                terminal_write(pass ? "pageperm: PASS\n" : "pageperm: FAIL\n");
+            }
+        }
+        else if (strcmp(buffer, "pmmtest") == 0) {
+            pmm_stats_t stats;
+            int pass = 1;
+            uint32_t initial_free, f1, f2, f3, contig;
+            int32_t delta;
+
+            pmm_get_stats(&stats);
+            initial_free = stats.free_frames;
+            terminal_write("pmmtest: initial free=");
+            shell_print_dec(initial_free);
+            terminal_write("\n");
+
+            f1 = pmm_alloc_frame();
+            f2 = pmm_alloc_frame();
+            f3 = pmm_alloc_frame();
+            if (f1 == 0 || f2 == 0 || f3 == 0) {
+                terminal_write("pmmtest: FAIL (alloc returned 0)\n");
+            } else {
+                pmm_get_stats(&stats);
+                delta = (int32_t)stats.free_frames - (int32_t)initial_free;
+                terminal_write("pmmtest: alloc 3 frames OK (free=");
+                shell_print_dec(stats.free_frames);
+                terminal_write(")\npmmtest: delta=");
+                if (delta < 0) { terminal_write("-"); shell_print_dec((uint32_t)(-delta)); }
+                else { shell_print_dec((uint32_t)delta); }
+                if (delta == -3) { terminal_write(" OK\n"); }
+                else { terminal_write(" FAIL\n"); pass = 0; }
+
+                pmm_free_frame(f1);
+                pmm_free_frame(f2);
+                pmm_free_frame(f3);
+                pmm_get_stats(&stats);
+                terminal_write("pmmtest: freed 3 frames (free=");
+                shell_print_dec(stats.free_frames);
+                terminal_write(")\n");
+                if (stats.free_frames == initial_free) {
+                    terminal_write("pmmtest: restored OK\n");
+                } else { terminal_write("pmmtest: restored FAIL\n"); pass = 0; }
+
+                contig = pmm_alloc_frames(4);
+                if (contig == 0) {
+                    terminal_write("pmmtest: contiguous alloc FAIL\n");
+                    pass = 0;
+                } else {
+                    terminal_write("pmmtest: contiguous alloc 4 at ");
+                    shell_print_hex(contig);
+                    terminal_write(" OK\n");
+                    pmm_free_frames(contig, 4);
+                    pmm_get_stats(&stats);
+                    terminal_write("pmmtest: contiguous free OK (free=");
+                    shell_print_dec(stats.free_frames);
+                    terminal_write(")\n");
+                    if (stats.free_frames != initial_free) pass = 0;
+                }
+                terminal_write(pass ? "pmmtest: PASS\n" : "pmmtest: FAIL\n");
+            }
+        }
+        else if (strcmp(buffer, "vmtest") == 0) {
+            int pass = 1;
+            void *region = vmalloc(8192);
+            if (region == NULL) {
+                terminal_write("vmtest: FAIL (vmalloc returned NULL)\n");
+            } else {
+                volatile uint32_t *p0 = (volatile uint32_t *)region;
+                volatile uint32_t *p1 = (volatile uint32_t *)((uint8_t *)region + 4096);
+                terminal_write("vmtest: vmalloc 8192 at ");
+                shell_print_hex((uint32_t)region);
+                terminal_write("\n");
+
+                *p0 = 0xDEAD0001;
+                terminal_write("vmtest: write page0 OK\n");
+                *p1 = 0xDEAD0002;
+                terminal_write("vmtest: write page1 OK\n");
+
+                if (*p0 == 0xDEAD0001) { terminal_write("vmtest: read page0 OK\n"); }
+                else { terminal_write("vmtest: read page0 FAIL\n"); pass = 0; }
+                if (*p1 == 0xDEAD0002) { terminal_write("vmtest: read page1 OK\n"); }
+                else { terminal_write("vmtest: read page1 FAIL\n"); pass = 0; }
+
+                vfree(region);
+                terminal_write("vmtest: vfree OK\n");
+                terminal_write(pass ? "vmtest: PASS\n" : "vmtest: FAIL\n");
+            }
+        }
+        else if (strcmp(buffer, "heaptest") == 0) {
+            int pass = 1;
+            kmalloc_stats_t stats;
+            void *a, *b, *c, *d;
+            uint32_t b_addr, d_addr;
+            int reuse;
+
+            a = kmalloc(64);
+            b = kmalloc(128);
+            c = kmalloc(64);
+            terminal_write("heaptest: alloc A=64 at ");
+            shell_print_hex((uint32_t)a);
+            terminal_write("\nheaptest: alloc B=128 at ");
+            shell_print_hex((uint32_t)b);
+            terminal_write("\nheaptest: alloc C=64 at ");
+            shell_print_hex((uint32_t)c);
+            terminal_write("\n");
+
+            b_addr = (uint32_t)b;
+            kfree(b);
+            terminal_write("heaptest: free B OK\n");
+
+            d = kmalloc(64);
+            d_addr = (uint32_t)d;
+            reuse = (d_addr >= b_addr && d_addr < b_addr + 128);
+            terminal_write("heaptest: alloc D=64 at ");
+            shell_print_hex(d_addr);
+            terminal_write(" (reuse=");
+            terminal_write(reuse ? "YES" : "NO");
+            terminal_write(")\n");
+
+            kfree(a);
+            terminal_write("heaptest: free A OK\n");
+            kfree(c);
+            terminal_write("heaptest: free C OK\n");
+            kfree(d);
+            terminal_write("heaptest: free D OK\n");
+
+            kmalloc_get_stats(&stats);
+            terminal_write("heaptest: allocs=");
+            shell_print_dec(stats.num_allocations);
+            if (stats.num_allocations == 0) { terminal_write(" OK\n"); }
+            else { terminal_write(" FAIL\n"); pass = 0; }
+            terminal_write(pass ? "heaptest: PASS\n" : "heaptest: FAIL\n");
+        }
+        /* --- Exception/interrupt test commands --- */
+        else if (strcmp(buffer, "div0") == 0) {
+            exception_test_caught = 0;
+            terminal_write("div0: installing handler\n");
+            idt_register_handler(0, div0_test_handler);
+            terminal_write("div0: triggering division by zero\n");
+            asm volatile(
+                "xor %%edx, %%edx\n\t"
+                "mov $1, %%eax\n\t"
+                "xor %%ecx, %%ecx\n\t"
+                "div %%ecx\n\t"
+                : : : "eax", "ecx", "edx"
+            );
+            idt_unregister_handler(0);
+            if (exception_test_caught) {
+                terminal_write("div0: caught exception ");
+                shell_print_dec(exception_test_vector);
+                terminal_write(" (Division by zero) at EIP=");
+                shell_print_hex(exception_test_eip);
+                terminal_write("\ndiv0: PASS\n");
+            } else {
+                terminal_write("div0: FAIL (exception not caught)\n");
+            }
+        }
+        else if (strcmp(buffer, "invop") == 0) {
+            exception_test_caught = 0;
+            terminal_write("invop: installing handler\n");
+            idt_register_handler(6, invop_test_handler);
+            terminal_write("invop: triggering invalid opcode\n");
+            asm volatile(".byte 0x0F, 0x0B"); /* ud2 */
+            idt_unregister_handler(6);
+            if (exception_test_caught) {
+                terminal_write("invop: caught exception ");
+                shell_print_dec(exception_test_vector);
+                terminal_write(" (Invalid opcode) at EIP=");
+                shell_print_hex(exception_test_eip);
+                terminal_write("\ninvop: PASS\n");
+            } else {
+                terminal_write("invop: FAIL (exception not caught)\n");
+            }
+        }
+        else if (strcmp(buffer, "segreg") == 0) {
+            uint16_t cs, ds, es, fs, gs, ss;
+            asm volatile("mov %%cs, %0" : "=r"(cs));
+            asm volatile("mov %%ds, %0" : "=r"(ds));
+            asm volatile("mov %%es, %0" : "=r"(es));
+            asm volatile("mov %%fs, %0" : "=r"(fs));
+            asm volatile("mov %%gs, %0" : "=r"(gs));
+            asm volatile("mov %%ss, %0" : "=r"(ss));
+            terminal_write("CS=");
+            shell_print_hex((uint32_t)cs);
+            terminal_write(" DS=");
+            shell_print_hex((uint32_t)ds);
+            terminal_write(" ES=");
+            shell_print_hex((uint32_t)es);
+            terminal_write(" FS=");
+            shell_print_hex((uint32_t)fs);
+            terminal_write(" GS=");
+            shell_print_hex((uint32_t)gs);
+            terminal_write(" SS=");
+            shell_print_hex((uint32_t)ss);
+            terminal_write("\n");
         }
         else if (strcmp(buffer, "int3") == 0) {
             terminal_write("Triggering breakpoint exception...\n");
