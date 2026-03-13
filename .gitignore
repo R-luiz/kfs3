@@ -53,3 +53,13 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Testing repo (cloned separately)
+kfs-testing/
+
+# Build directory
+build/
+
+# Python
+__pycache__/
+*.pyc

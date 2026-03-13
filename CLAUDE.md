@@ -5,15 +5,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-make              # Build kernel.bin
-make run          # Run in QEMU (auto-detects GTK/SDL/VNC, falls back to serial)
-make test-kfs     # Run automated Python test suite (tools/test_kfs.py)
-make image        # Create bootable GRUB disk image
-make run-image    # Boot from disk image
-make debug        # Run QEMU with GDB debugging on port 1234
-make check-multiboot  # Verify multiboot header in kernel.bin
-make clean        # Remove build artifacts
+make                       # Build kernel.bin (in-tree, BUILD_DIR=.)
+make BUILD_DIR=build       # Build to build/ directory (out-of-tree)
+make run                   # Run in QEMU (auto-detects GTK/SDL/VNC, falls back to serial)
+make test-kfs              # Build kernel + run all tests
+make test-kfs KFS=3        # Only KFS-3 tests
+make test-kfs KFS="2 3"    # KFS-2 and KFS-3 tests
+make image                 # Create bootable GRUB disk image
+make run-image             # Boot from disk image
+make debug                 # Run QEMU with GDB debugging on port 1234
+make check-multiboot       # Verify multiboot header in kernel.bin
+make clean                 # Remove build artifacts
 ```
+
+### Test Suite (kfs-testing/)
+
+The test suite lives in a separate `kfs-testing/` repo cloned inside this project. Run via Make:
 
 **Toolchain requirements**: GCC (32-bit), NASM, GNU ld, QEMU (`qemu-system-i386`), Python 3, GRUB 2 (for `make image`).
 
