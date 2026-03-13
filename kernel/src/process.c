@@ -185,6 +185,10 @@ static void process_release(process_t *process)
         return;
     }
 
+    if (scheduler_cursor == process) {
+        scheduler_cursor = process_head;
+    }
+
     process_release_memory(process);
     process_unlink_child(process);
     process_unlink_global(process);
@@ -872,12 +876,25 @@ process_t *schedule_next_process(void)
     return next_process;
 }
 
+static void process_deliver_all_pending_signals(void)
+{
+    process_t *p = process_head;
+
+    while (p != NULL) {
+        if (p->used && p->signal_head != p->signal_tail) {
+            deliver_process_signal(p);
+        }
+        p = p->next;
+    }
+}
+
 uint32_t scheduler_run_pending(uint32_t max_ticks)
 {
     uint32_t executed = 0;
 
     while (pending_scheduler_ticks > 0 && executed < max_ticks) {
         pending_scheduler_ticks--;
+        process_deliver_all_pending_signals();
         schedule_next_process();
         executed++;
     }
