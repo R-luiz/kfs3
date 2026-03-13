@@ -217,12 +217,18 @@ static void shell_print_process_summary(process_t *process)
     shell_print_dec(process_signal_pending_count(process));
     terminal_write(" SOCKQ=");
     shell_print_dec(process_socket_pending_count(process));
+    terminal_write(" CR3=");
+    shell_print_hex((uint32_t)process->memory.process_page_directory);
     terminal_write(" PAGE=");
     shell_print_hex(process->memory.process_page);
     terminal_write(" HEAP=");
     shell_print_hex(process->memory.heap_start);
     terminal_write(" STACK=");
     shell_print_hex(process->memory.stack_top);
+    terminal_write(" ESP=");
+    shell_print_hex(process->context.esp);
+    terminal_write(" SWITCH=");
+    shell_print_dec(process->switch_count);
     terminal_write(" LASTSIG=");
     shell_print_dec(process->last_signal);
     terminal_write(" SIGVAL=");
@@ -633,6 +639,8 @@ void shell_run(void) {
             shell_print_dec(scheduler_tick_count());
             terminal_write("  PIT ticks: ");
             shell_print_dec(timer_get_ticks());
+            terminal_write("  Context switches: ");
+            shell_print_dec(process_context_switch_count());
             terminal_write("\n");
 
             while (process != NULL) {

@@ -28,6 +28,7 @@ KERNEL_OBJS = boot/boot.o \
               kernel/src/main.o \
 			  kernel/src/timer.o \
 			  kernel/src/process.o \
+			  kernel/src/process_switch.o \
 			  kernel/src/interrupts.o \
 			  kernel/src/idt.o \
               kernel/src/keyboard.o \

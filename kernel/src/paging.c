@@ -13,6 +13,7 @@ static page_table_t kernel_page_tables[4] __attribute__((aligned(4096)));
 
 /* Current page directory */
 static page_directory_t *current_directory = NULL;
+static page_directory_t *kernel_directory = NULL;
 
 /* Simple memset implementation */
 static void *memset_paging(void *ptr, int value, size_t size)
@@ -95,92 +96,128 @@ void paging_init(void)
 
     /* Set current directory */
     current_directory = &kernel_page_directory;
+    kernel_directory = &kernel_page_directory;
 
     /* Load page directory and enable paging */
     load_page_directory((uint32_t)&kernel_page_directory);
     paging_enable();
 }
 
-/* Map a virtual address to a physical address */
-void paging_map_page(uint32_t virt_addr, uint32_t phys_addr, uint32_t flags)
+void paging_copy_directory(page_directory_t *destination, const page_directory_t *source)
+{
+    if (destination == NULL || source == NULL) {
+        return;
+    }
+
+    memset_paging(destination, 0, sizeof(page_directory_t));
+    for (int i = 0; i < PAGE_DIR_ENTRIES; i++) {
+        destination->entries[i] = source->entries[i];
+    }
+}
+
+static page_table_t *paging_get_or_create_table(page_directory_t *directory, uint32_t virt_addr, uint32_t flags)
 {
     uint32_t dir_idx = PAGE_DIR_INDEX(virt_addr);
-    uint32_t table_idx = PAGE_TABLE_INDEX(virt_addr);
-
-    /* Get or create page table */
     page_table_t *table;
 
-    if (!(current_directory->entries[dir_idx] & PAGE_PRESENT)) {
-        /* Allocate a new page table */
+    if (!(directory->entries[dir_idx] & PAGE_PRESENT)) {
         uint32_t table_phys = pmm_alloc_frame();
         if (table_phys == 0) {
             panic("paging_map_page: Out of memory for page table");
-            return;
+            return NULL;
         }
 
-        /* Clear the new page table */
-        table = (page_table_t*)table_phys;
+        table = (page_table_t *)table_phys;
         memset_paging(table, 0, sizeof(page_table_t));
 
-        /* Add to directory */
-        current_directory->entries[dir_idx] = table_phys | PAGE_PRESENT | PAGE_WRITE;
+        directory->entries[dir_idx] = table_phys | PAGE_PRESENT | PAGE_WRITE;
         if (flags & PAGE_USER) {
-            current_directory->entries[dir_idx] |= PAGE_USER;
+            directory->entries[dir_idx] |= PAGE_USER;
         }
     } else {
         if (flags & PAGE_USER) {
-            current_directory->entries[dir_idx] |= PAGE_USER;
+            directory->entries[dir_idx] |= PAGE_USER;
         }
-        table = (page_table_t*)PAGE_FRAME(current_directory->entries[dir_idx]);
+        table = (page_table_t *)PAGE_FRAME(directory->entries[dir_idx]);
     }
 
-    /* Map the page */
+    return table;
+}
+
+void paging_map_page_in_directory(page_directory_t *directory, uint32_t virt_addr, uint32_t phys_addr, uint32_t flags)
+{
+    uint32_t table_idx = PAGE_TABLE_INDEX(virt_addr);
+    page_table_t *table;
+
+    if (directory == NULL) {
+        return;
+    }
+
+    table = paging_get_or_create_table(directory, virt_addr, flags);
+    if (table == NULL) {
+        return;
+    }
+
     table->entries[table_idx] = (phys_addr & 0xFFFFF000) | (flags & 0xFFF);
 
-    /* Flush TLB for this address */
-    paging_flush_tlb(virt_addr);
+    if (directory == current_directory) {
+        paging_flush_tlb(virt_addr);
+    }
+}
+
+/* Map a virtual address to a physical address */
+void paging_map_page(uint32_t virt_addr, uint32_t phys_addr, uint32_t flags)
+{
+    paging_map_page_in_directory(current_directory, virt_addr, phys_addr, flags);
+}
+
+void paging_unmap_page_in_directory(page_directory_t *directory, uint32_t virt_addr)
+{
+    uint32_t dir_idx = PAGE_DIR_INDEX(virt_addr);
+    uint32_t table_idx = PAGE_TABLE_INDEX(virt_addr);
+    page_table_t *table;
+
+    if (directory == NULL || !(directory->entries[dir_idx] & PAGE_PRESENT)) {
+        return;
+    }
+
+    table = (page_table_t *)PAGE_FRAME(directory->entries[dir_idx]);
+    table->entries[table_idx] = 0;
+
+    if (directory == current_directory) {
+        paging_flush_tlb(virt_addr);
+    }
 }
 
 /* Unmap a virtual address */
 void paging_unmap_page(uint32_t virt_addr)
 {
+    paging_unmap_page_in_directory(current_directory, virt_addr);
+}
+
+uint32_t paging_get_physical_in_directory(page_directory_t *directory, uint32_t virt_addr)
+{
     uint32_t dir_idx = PAGE_DIR_INDEX(virt_addr);
     uint32_t table_idx = PAGE_TABLE_INDEX(virt_addr);
+    uint32_t offset = PAGE_OFFSET(virt_addr);
+    page_table_t *table;
 
-    /* Check if page table exists */
-    if (!(current_directory->entries[dir_idx] & PAGE_PRESENT)) {
-        return;  /* Not mapped */
+    if (directory == NULL || !(directory->entries[dir_idx] & PAGE_PRESENT)) {
+        return 0;
     }
 
-    page_table_t *table = (page_table_t*)PAGE_FRAME(current_directory->entries[dir_idx]);
+    table = (page_table_t *)PAGE_FRAME(directory->entries[dir_idx]);
+    if (!(table->entries[table_idx] & PAGE_PRESENT)) {
+        return 0;
+    }
 
-    /* Clear the entry */
-    table->entries[table_idx] = 0;
-
-    /* Flush TLB */
-    paging_flush_tlb(virt_addr);
+    return PAGE_FRAME(table->entries[table_idx]) | offset;
 }
 
 /* Get physical address for virtual address */
 uint32_t paging_get_physical(uint32_t virt_addr)
 {
-    uint32_t dir_idx = PAGE_DIR_INDEX(virt_addr);
-    uint32_t table_idx = PAGE_TABLE_INDEX(virt_addr);
-    uint32_t offset = PAGE_OFFSET(virt_addr);
-
-    /* Check if page table exists */
-    if (!(current_directory->entries[dir_idx] & PAGE_PRESENT)) {
-        return 0;  /* Not mapped */
-    }
-
-    page_table_t *table = (page_table_t*)PAGE_FRAME(current_directory->entries[dir_idx]);
-
-    /* Check if page is present */
-    if (!(table->entries[table_idx] & PAGE_PRESENT)) {
-        return 0;  /* Not mapped */
-    }
-
-    return PAGE_FRAME(table->entries[table_idx]) | offset;
+    return paging_get_physical_in_directory(current_directory, virt_addr);
 }
 
 /* Check if a page is mapped */
@@ -201,6 +238,21 @@ int paging_is_mapped(uint32_t virt_addr)
 page_directory_t* paging_get_directory(void)
 {
     return current_directory;
+}
+
+page_directory_t* paging_get_kernel_directory(void)
+{
+    return kernel_directory;
+}
+
+void paging_switch_directory(page_directory_t *directory)
+{
+    if (directory == NULL) {
+        return;
+    }
+
+    current_directory = directory;
+    load_page_directory((uint32_t)directory);
 }
 
 /* Identity map a range */

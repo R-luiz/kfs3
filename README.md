@@ -16,6 +16,8 @@ This kernel now covers the KFS-2, KFS-3, KFS-4, and KFS-5 milestones for a bare-
 - **Syscall Foundation** - `int 0x80` entry point and syscall table scaffold
 - **Process Interface** - PID/state/owner/kinship tracking with per-process memory metadata
 - **Multitasking Scheduler** - IRQ0/PIT-driven tick scheduler for in-kernel process demos
+- **Saved CPU Context Switching** - Per-process `esp`/`ebp`/`eip` state with dedicated process stacks
+- **Per-Process Address Spaces** - Scheduler switches CR3 into process-specific page directories
 - **Process IPC** - Simple socket-style queued message passing between processes
 - **exec_fn Process Demos** - Run kernel functions as scheduled processes to prove the API
 - **Kernel Panic Handler** - Error handling with visual feedback
@@ -66,6 +68,8 @@ This kernel now covers the KFS-2, KFS-3, KFS-4, and KFS-5 milestones for a bare-
 - `process_t` records PID, owner, parent/children, state, signals, stack, heap, and address-space metadata
 - Dedicated per-process mapped pages for data, BSS, heap, and stack
 - Round-robin scheduler driven by the PIT on IRQ0
+- Cooperative saved-context switching between the kernel scheduler and process stacks
+- Per-process page directory switching before each scheduled run
 - `fork`, `wait`, `_exit`, `getuid`, `signal`, and `kill` helper paths registered in the syscall layer
 - Socket-style IPC queue between processes
 - `exec_fn` process execution path for in-kernel demo workloads

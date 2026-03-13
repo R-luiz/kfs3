@@ -39,6 +39,15 @@ typedef struct process_socket {
     uint32_t tail;
 } process_socket_t;
 
+typedef struct process_context {
+    uint32_t ebx;
+    uint32_t esi;
+    uint32_t edi;
+    uint32_t ebp;
+    uint32_t esp;
+    uint32_t eip;
+} process_context_t;
+
 struct process;
 typedef struct process process_t;
 typedef void (*process_exec_fn_t)(process_t *process);
@@ -64,6 +73,7 @@ typedef struct process_memory {
     uint32_t bss_page;
     uint32_t heap_page;
     uint32_t stack_page;
+    uint32_t process_page_table;
     uint32_t code_size;
 } process_memory_t;
 
@@ -83,8 +93,10 @@ struct process {
     process_socket_t process_socket;
     process_exec_fn_t entry;
     process_signal_handler_t signal_handler;
+    process_context_t context;
     uint32_t cpu_ticks;
     uint32_t run_count;
+    uint32_t switch_count;
     uint32_t last_signal;
     uint32_t last_signal_value;
     uint32_t last_socket_value;
@@ -108,6 +120,8 @@ const char *process_status_name(process_status_t status);
 process_t *process_create_owned(uint32_t owner, process_exec_fn_t function, uint32_t size);
 process_t *exec_fn(uint32_t addr, process_exec_fn_t function, uint32_t size);
 process_t *fork_process(process_t *source);
+void process_yield(void);
+uint32_t process_context_switch_count(void);
 
 int alloc_process_page(process_t *process, uint32_t virtual_page, uint32_t *physical_page);
 int process_memory_map(process_t *process);
@@ -140,6 +154,8 @@ uint32_t scheduler_run_pending(uint32_t max_ticks);
 uint32_t scheduler_force_ticks(uint32_t count);
 uint32_t scheduler_tick_count(void);
 int multitasking_enabled(void);
+
+void process_context_switch(process_context_t *from, process_context_t *to);
 
 process_t *process_spawn_demo_counter(uint32_t owner, uint32_t seed, uint32_t limit);
 int process_spawn_demo_socket_pair(uint32_t owner, uint32_t value, uint32_t *sender_pid, uint32_t *receiver_pid);

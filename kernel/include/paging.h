@@ -62,17 +62,35 @@ void paging_disable(void);
 /* Map a virtual address to a physical address */
 void paging_map_page(uint32_t virt_addr, uint32_t phys_addr, uint32_t flags);
 
+/* Map a page in a specific page directory */
+void paging_map_page_in_directory(page_directory_t *directory, uint32_t virt_addr, uint32_t phys_addr, uint32_t flags);
+
 /* Unmap a virtual address */
 void paging_unmap_page(uint32_t virt_addr);
 
+/* Unmap a page in a specific page directory */
+void paging_unmap_page_in_directory(page_directory_t *directory, uint32_t virt_addr);
+
 /* Get the physical address for a virtual address */
 uint32_t paging_get_physical(uint32_t virt_addr);
+
+/* Get the physical address for a virtual address in a specific page directory */
+uint32_t paging_get_physical_in_directory(page_directory_t *directory, uint32_t virt_addr);
 
 /* Check if a page is mapped */
 int paging_is_mapped(uint32_t virt_addr);
 
 /* Get the current page directory */
 page_directory_t* paging_get_directory(void);
+
+/* Get the kernel page directory */
+page_directory_t* paging_get_kernel_directory(void);
+
+/* Clone or copy an existing page directory */
+void paging_copy_directory(page_directory_t *destination, const page_directory_t *source);
+
+/* Switch to a specific page directory */
+void paging_switch_directory(page_directory_t *directory);
 
 /* Flush TLB for a specific address */
 void paging_flush_tlb(uint32_t addr);

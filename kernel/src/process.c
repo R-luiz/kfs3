@@ -5,6 +5,7 @@
 
 static process_t process_table[PROCESS_MAX_COUNT];
 static page_directory_t process_page_directories[PROCESS_MAX_COUNT] __attribute__((aligned(4096)));
+static process_context_t scheduler_context;
 static process_t *process_head = NULL;
 static process_t *current_process = NULL;
 static process_t *kernel_process = NULL;
@@ -12,7 +13,10 @@ static process_t *scheduler_cursor = NULL;
 static uint32_t next_pid = 1;
 static uint32_t pending_scheduler_ticks = 0;
 static uint32_t total_scheduler_ticks = 0;
+static uint32_t total_context_switches = 0;
 static int scheduler_enabled = 0;
+
+static void process_bootstrap(void);
 
 static void *process_memset(void *ptr, int value, size_t size)
 {
@@ -151,20 +155,25 @@ static void process_reset_memory(process_memory_t *memory)
 static void process_release_memory(process_t *process)
 {
     if (process->memory.data_page != 0) {
-        paging_unmap_page(process->memory.data_start);
+        paging_unmap_page_in_directory(process->memory.process_page_directory, process->memory.data_start);
         pmm_free_frame(process->memory.data_page);
     }
     if (process->memory.bss_page != 0) {
-        paging_unmap_page(process->memory.bss_start);
+        paging_unmap_page_in_directory(process->memory.process_page_directory, process->memory.bss_start);
         pmm_free_frame(process->memory.bss_page);
     }
     if (process->memory.heap_page != 0) {
-        paging_unmap_page(process->memory.heap_start);
+        paging_unmap_page_in_directory(process->memory.process_page_directory, process->memory.heap_start);
         pmm_free_frame(process->memory.heap_page);
     }
     if (process->memory.stack_page != 0) {
-        paging_unmap_page(process->memory.stack_base);
+        paging_unmap_page_in_directory(process->memory.process_page_directory, process->memory.stack_base);
         pmm_free_frame(process->memory.stack_page);
+    }
+    if (process->memory.process_page_directory != NULL && process->memory.process_page_table != 0) {
+        uint32_t dir_idx = PAGE_DIR_INDEX(process->memory.virtual_base);
+        process->memory.process_page_directory->entries[dir_idx] = 0;
+        pmm_free_frame(process->memory.process_page_table);
     }
 
     process_reset_memory(&process->memory);
@@ -207,6 +216,42 @@ static void process_default_signal_handler(process_t *process, int signal, uint3
     }
 }
 
+static void process_switch_to_kernel_space(void)
+{
+    if (kernel_process != NULL && kernel_process->memory.process_page_directory != NULL) {
+        paging_switch_directory(kernel_process->memory.process_page_directory);
+    }
+}
+
+static void process_bootstrap(void)
+{
+    process_t *process = current_process;
+
+    if (process == NULL || process == kernel_process || process->entry == NULL) {
+        process_switch_to_kernel_space();
+        process_context_switch(&scheduler_context, &scheduler_context);
+        return;
+    }
+
+    process->entry(process);
+    process_exit(process, (int)process->runtime_value);
+    process_yield();
+
+    while (1) {
+    }
+}
+
+static void process_initialize_context(process_t *process)
+{
+    uint32_t stack_pointer;
+
+    process_memset(&process->context, 0, sizeof(process_context_t));
+    stack_pointer = (process->memory.stack_top - 16U) & ~0x0FU;
+    process->context.esp = stack_pointer;
+    process->context.ebp = stack_pointer;
+    process->context.eip = (uint32_t)process_bootstrap;
+}
+
 static process_t *process_create_internal(process_t *parent, uint32_t owner, uint32_t requested_base, process_exec_fn_t function, uint32_t size)
 {
     process_t *process = process_allocate_slot();
@@ -216,7 +261,7 @@ static process_t *process_create_internal(process_t *parent, uint32_t owner, uin
     }
 
     process->pid = next_pid++;
-    process->status = PROCESS_STATUS_THREAD;
+    process->status = PROCESS_STATUS_READY;
     process->owner = owner;
     process->rights = PROCESS_RIGHT_ALL;
     process->entry = function;
@@ -229,14 +274,16 @@ static process_t *process_create_internal(process_t *parent, uint32_t owner, uin
         return NULL;
     }
 
+    process_initialize_context(process);
+
     process_link_child(parent, process);
     process_link_global(process);
 
-    if (process->memory.data_start != 0) {
-        *((uint32_t *)process->memory.data_start) = 0;
+    if (process->memory.data_page != 0) {
+        *((uint32_t *)process->memory.data_page) = 0;
     }
-    if (process->memory.bss_start != 0) {
-        *((uint32_t *)process->memory.bss_start) = 0;
+    if (process->memory.bss_page != 0) {
+        *((uint32_t *)process->memory.bss_page) = 0;
     }
 
     return process;
@@ -244,45 +291,44 @@ static process_t *process_create_internal(process_t *parent, uint32_t owner, uin
 
 static void demo_counter_process(process_t *process)
 {
-    uint32_t *counter = (uint32_t *)process->memory.data_start;
-    uint32_t *step_count = (uint32_t *)process->memory.bss_start;
+    volatile uint32_t counter = process->runtime_arg0;
+    volatile uint32_t iterations = 0;
+    volatile uint32_t limit = process->runtime_arg1;
 
-    if (process->runtime_state == 0) {
-        *counter = process->runtime_arg0;
-        *step_count = 0;
-        process->runtime_state = 1;
+    while (counter < limit) {
+        counter++;
+        iterations++;
+        *((uint32_t *)process->memory.data_start) = counter;
+        *((uint32_t *)process->memory.bss_start) = iterations;
+        process->runtime_value = counter;
+        process->runtime_state = iterations;
+        process_yield();
     }
 
-    (*counter)++;
-    (*step_count)++;
-    process->runtime_value = *counter;
-
-    if (*counter >= process->runtime_arg1) {
-        process_exit(process, (int)*counter);
-    }
+    process_exit(process, (int)counter);
 }
 
 static void demo_socket_receiver_process(process_t *process)
 {
-    uint32_t value;
+    uint32_t value = 0;
 
-    if (socket_recv(process, &value) == 0) {
-        *((uint32_t *)process->memory.data_start) = value;
-        process->last_socket_value = value;
-        process_exit(process, (int)(value & 0xFFFF));
+    while (socket_recv(process, &value) != 0) {
+        process_yield();
     }
+
+    *((uint32_t *)process->memory.data_start) = value;
+    process->last_socket_value = value;
+    process_exit(process, (int)(value & 0xFFFF));
 }
 
 static void demo_socket_sender_process(process_t *process)
 {
-    if (process->runtime_state != 0) {
-        return;
+    while (socket_send(process, process->runtime_arg0, process->runtime_arg1) != 0) {
+        process_yield();
     }
 
-    if (socket_send(process, process->runtime_arg0, process->runtime_arg1) == 0) {
-        process->runtime_state = 1;
-        process_exit(process, 0);
-    }
+    process->runtime_state = 1;
+    process_exit(process, 0);
 }
 
 void process_init(void)
@@ -310,6 +356,8 @@ void process_init(void)
     scheduler_enabled = 1;
     pending_scheduler_ticks = 0;
     total_scheduler_ticks = 0;
+    total_context_switches = 0;
+    process_memset(&scheduler_context, 0, sizeof(scheduler_context));
 }
 
 process_t *process_root(void)
@@ -393,8 +441,8 @@ int alloc_process_page(process_t *process, uint32_t virtual_page, uint32_t *phys
         return -1;
     }
 
-    paging_map_page(virtual_page, page, PAGE_USER_RW);
-    process_memset((void *)virtual_page, 0, PAGE_SIZE);
+    paging_map_page_in_directory(process->memory.process_page_directory, virtual_page, page, PAGE_USER_RW);
+    process_memset((void *)page, 0, PAGE_SIZE);
 
     if (physical_page != NULL) {
         *physical_page = page;
@@ -407,13 +455,14 @@ int process_memory_map(process_t *process)
 {
     page_directory_t *kernel_directory;
     uint32_t slot;
+    uint32_t dir_idx;
 
     if (process == NULL) {
         return -1;
     }
 
     slot = process_slot_index(process);
-    kernel_directory = paging_get_directory();
+    kernel_directory = paging_get_kernel_directory();
 
     if (process->memory.virtual_base == 0) {
         process->memory.virtual_base = process_virtual_base_for_slot(slot);
@@ -433,7 +482,7 @@ int process_memory_map(process_t *process)
     process->memory.stack_top = process->memory.stack_base + PAGE_SIZE;
     process->memory.process_page_directory = &process_page_directories[slot];
 
-    process_memcpy(process->memory.process_page_directory, kernel_directory, sizeof(page_directory_t));
+    paging_copy_directory(process->memory.process_page_directory, kernel_directory);
 
     if (alloc_process_page(process, process->memory.data_start, &process->memory.data_page) != 0) {
         process_release_memory(process);
@@ -453,6 +502,8 @@ int process_memory_map(process_t *process)
     }
 
     process->memory.physical_page = process->memory.data_page;
+    dir_idx = PAGE_DIR_INDEX(process->memory.virtual_base);
+    process->memory.process_page_table = PAGE_FRAME(process->memory.process_page_directory->entries[dir_idx]);
     return 0;
 }
 
@@ -661,12 +712,37 @@ process_t *fork_process(process_t *source)
     child->runtime_value = source->runtime_value;
     child->runtime_arg0 = source->runtime_arg0;
     child->runtime_arg1 = source->runtime_arg1;
+    child->last_signal = source->last_signal;
+    child->last_signal_value = source->last_signal_value;
 
-    process_memcpy((void *)child->memory.data_start, (const void *)source->memory.data_start, PAGE_SIZE);
-    process_memcpy((void *)child->memory.bss_start, (const void *)source->memory.bss_start, PAGE_SIZE);
-    process_memcpy((void *)child->memory.heap_start, (const void *)source->memory.heap_start, PAGE_SIZE);
+    process_memcpy((void *)child->memory.data_page, (const void *)source->memory.data_page, PAGE_SIZE);
+    process_memcpy((void *)child->memory.bss_page, (const void *)source->memory.bss_page, PAGE_SIZE);
+    process_memcpy((void *)child->memory.heap_page, (const void *)source->memory.heap_page, PAGE_SIZE);
     child->memory.heap_break = child->memory.heap_start + (source->memory.heap_break - source->memory.heap_start);
+    child->status = PROCESS_STATUS_READY;
     return child;
+}
+
+void process_yield(void)
+{
+    process_t *process = current_process;
+
+    if (process == NULL || process == kernel_process) {
+        return;
+    }
+
+    if (process->status == PROCESS_STATUS_RUN) {
+        process->status = PROCESS_STATUS_READY;
+    }
+
+    total_context_switches++;
+    process->switch_count++;
+    process_context_switch(&process->context, &scheduler_context);
+}
+
+uint32_t process_context_switch_count(void)
+{
+    return total_context_switches;
 }
 
 int process_wait(process_t *parent, uint32_t pid, int *exit_code)
@@ -712,6 +788,11 @@ void process_exit(process_t *process, int exit_code)
 
     process->exit_code = exit_code;
     process->status = PROCESS_STATUS_ZOMBIE;
+
+    if (process->parent != NULL && process->parent->status == PROCESS_STATUS_WAITING &&
+        (process->parent->wait_target_pid == 0 || process->parent->wait_target_pid == process->pid)) {
+        process->parent->status = PROCESS_STATUS_READY;
+    }
 }
 
 uint32_t process_getuid(process_t *process)
@@ -775,9 +856,13 @@ process_t *schedule_next_process(void)
         next_process->status = PROCESS_STATUS_RUN;
         next_process->cpu_ticks++;
         next_process->run_count++;
-        next_process->entry(next_process);
+        total_context_switches++;
+        next_process->switch_count++;
+        paging_switch_directory(next_process->memory.process_page_directory);
+        process_context_switch(&scheduler_context, &next_process->context);
+        process_switch_to_kernel_space();
         if (next_process->status == PROCESS_STATUS_RUN) {
-            next_process->status = PROCESS_STATUS_THREAD;
+            next_process->status = PROCESS_STATUS_READY;
         }
     }
 

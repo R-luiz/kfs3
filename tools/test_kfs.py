@@ -944,7 +944,7 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
         report.add(
             "KFS5 mandatory",
             "The shell can inspect the process table and scheduler state",
-            all(token in procs_output for token in ["=== Process Table ===", "PID=1", "STATE=THREAD", "OWNER=0", "CPU ticks:", "PIT ticks:"]),
+            all(token in procs_output for token in ["=== Process Table ===", "PID=1", "STATE=THREAD", "OWNER=0", "CPU ticks:", "PIT ticks:", "Context switches:", "CR3=", "ESP=", "SWITCH="]),
             procs_output,
         )
 

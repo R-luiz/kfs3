@@ -60,7 +60,7 @@ const char* HEADER[] = {
     "   A    A   N  NN    T    H   H  R  R  O   O D   D  R  R  ",
     "   A    A   N   N    T    H   H  R   R  OOO  DDDD   R   R ",
     "",
-    "               Anthrodr - KFS-2-3-4 (Memory & Paging)            ",
+    "           Anthrodr - KFS-5 (Processes, Scheduling, Memory)      ",
     "",
     NULL
 };
