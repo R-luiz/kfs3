@@ -185,6 +185,10 @@ static void process_release(process_t *process)
         return;
     }
 
+    if (scheduler_cursor == process) {
+        scheduler_cursor = process_head;
+    }
+
     process_release_memory(process);
     process_unlink_child(process);
     process_unlink_global(process);
@@ -209,7 +213,6 @@ static void process_default_signal_handler(process_t *process, int signal, uint3
 {
     process->last_signal = (uint32_t)signal;
     process->last_signal_value = value;
-    process->runtime_value = value;
 
     if (signal == PROCESS_SIGNAL_TERM || signal == PROCESS_SIGNAL_KILL) {
         process_exit(process, 128 + signal);
@@ -785,6 +788,9 @@ void process_exit(process_t *process, int exit_code)
     if (process == NULL || process == kernel_process) {
         return;
     }
+    if (process->status == PROCESS_STATUS_ZOMBIE) {
+        return;
+    }
 
     process->exit_code = exit_code;
     process->status = PROCESS_STATUS_ZOMBIE;
@@ -870,12 +876,25 @@ process_t *schedule_next_process(void)
     return next_process;
 }
 
+static void process_deliver_all_pending_signals(void)
+{
+    process_t *p = process_head;
+
+    while (p != NULL) {
+        if (p->used && p->signal_head != p->signal_tail) {
+            deliver_process_signal(p);
+        }
+        p = p->next;
+    }
+}
+
 uint32_t scheduler_run_pending(uint32_t max_ticks)
 {
     uint32_t executed = 0;
 
     while (pending_scheduler_ticks > 0 && executed < max_ticks) {
         pending_scheduler_ticks--;
+        process_deliver_all_pending_signals();
         schedule_next_process();
         executed++;
     }

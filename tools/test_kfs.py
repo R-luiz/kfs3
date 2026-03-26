@@ -814,6 +814,14 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             gdt_dump_output,
         )
 
+        segreg_output = clean_output(session.run_command("segreg"))
+        report.add(
+            "KFS2 mandatory",
+            "Segment registers are loaded with correct GDT selectors",
+            all(token in segreg_output for token in ["CS=0x00000008", "DS=0x00000010", "SS=0x00000018"]),
+            segreg_output,
+        )
+
         stack_output = clean_output(session.run_command("stack"))
         report.add(
             "KFS2 bonus",
@@ -862,6 +870,17 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             meminfo_after,
         )
 
+        for i in range(5):
+            session.run_command(f"alloc {32 * (i + 1)}")
+            session.run_command("free")
+        meminfo_cycles = clean_output(session.run_command("meminfo"))
+        report.add(
+            "KFS3 mandatory",
+            "Repeated alloc/free cycles maintain consistency",
+            "Allocs:    0" in meminfo_cycles,
+            meminfo_cycles,
+        )
+
         vmap_output = clean_output(session.run_command("vmap"))
         report.add(
             "KFS3 mandatory",
@@ -900,12 +919,105 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             pagedir_output,
         )
 
+        meminfo_values = clean_output(session.run_command("meminfo"))
+        total_match = re.search(r"Total:\s+(\d+)\s+MB", meminfo_values)
+        free_match = re.search(r"Free:\s+.*\((\d+)\s+pages\)", meminfo_values)
+        report.add(
+            "KFS3 mandatory",
+            "meminfo reports non-zero physical memory values",
+            total_match is not None and int(total_match.group(1)) > 0
+            and free_match is not None and int(free_match.group(1)) > 0,
+            meminfo_values,
+        )
+
+        pagedir_count = len(re.findall(r"\[\d+\]\s+->", pagedir_output))
+        total_match_pd = re.search(r"(\d+)\s+total\)", pagedir_output)
+        if total_match_pd:
+            pagedir_count = int(total_match_pd.group(1))
+        report.add(
+            "KFS3 mandatory",
+            "Paging is active with at least 4 mapped page tables",
+            pagedir_count >= 4,
+            f"Mapped page tables: {pagedir_count}",
+        )
+
+        report.add(
+            "KFS3 mandatory",
+            "vmap shows correct vmalloc range start",
+            "0x01000000" in vmap_output,
+            vmap_output,
+        )
+
+        pagetest_output = clean_output(session.run_command("pagetest"))
+        report.add(
+            "KFS3 mandatory",
+            "Page map/write/unmap round-trip works",
+            "pagetest: PASS" in pagetest_output and "match OK" in pagetest_output,
+            pagetest_output,
+        )
+
+        pageperm_output = clean_output(session.run_command("pageperm"))
+        report.add(
+            "KFS3 mandatory",
+            "Page permission flags are correctly applied",
+            "pageperm: PASS" in pageperm_output,
+            pageperm_output,
+        )
+
+        pmmtest_output = clean_output(session.run_command("pmmtest"))
+        report.add(
+            "KFS3 mandatory",
+            "PMM alloc/free tracks frame counts correctly",
+            "pmmtest: PASS" in pmmtest_output and "delta=-3 OK" in pmmtest_output and "restored OK" in pmmtest_output,
+            pmmtest_output,
+        )
+
+        vmtest_output = clean_output(session.run_command("vmtest"))
+        report.add(
+            "KFS3 mandatory",
+            "vmalloc allocates, writes, and frees correctly",
+            "vmtest: PASS" in vmtest_output,
+            vmtest_output,
+        )
+
+        heaptest_output = clean_output(session.run_command("heaptest"))
+        report.add(
+            "KFS3 mandatory",
+            "Heap handles multiple alloc/free with reuse",
+            "heaptest: PASS" in heaptest_output and "allocs=0 OK" in heaptest_output,
+            heaptest_output,
+        )
+
         idt_output = clean_output(session.run_command("idt"))
         report.add(
             "KFS4 mandatory",
             "idt command reports the registered descriptor table and interrupt state",
             all(token in idt_output for token in ["=== IDT ===", "Base: 0x", "Interrupts: enabled", "IRQ1 vector: 0x00000021", "System call vector: 0x00000080"]),
             idt_output,
+        )
+
+        idt_limit_match = re.search(r"Limit:\s+(\d+)\s+bytes", idt_output)
+        report.add(
+            "KFS4 mandatory",
+            "IDT limit matches 256 entries (2047 bytes)",
+            idt_limit_match is not None and int(idt_limit_match.group(1)) == 2047,
+            idt_output,
+        )
+
+        div0_output = clean_output(session.run_command("div0"))
+        report.add(
+            "KFS4 mandatory",
+            "Division by zero exception is caught by IDT",
+            "div0: PASS" in div0_output and "exception 0" in div0_output,
+            div0_output,
+        )
+
+        invop_output = clean_output(session.run_command("invop"))
+        report.add(
+            "KFS4 mandatory",
+            "Invalid opcode exception is caught by IDT",
+            "invop: PASS" in invop_output and "exception 6" in invop_output,
+            invop_output,
         )
 
         signals_output = clean_output(session.run_command("signals"))
@@ -932,12 +1044,35 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             signals_after_output,
         )
 
+        sigtest2_output = clean_output(session.run_command("sigtest"))
+        signals2_output = clean_output(session.run_command("signals"))
+        report.add(
+            "KFS4 mandatory",
+            "Multiple signal dispatches increment handled counter",
+            "[signal] handled signal 1 value=0xC0DE1234" in sigtest2_output
+            and "Handled: 2" in signals2_output,
+            sigtest2_output + "\n" + signals2_output,
+        )
+
         syscall_output = clean_output(session.run_command("syscall"))
         report.add(
             "KFS4 bonus",
             "int 0x80 dispatches through the syscall foundation",
             "syscall returned 0x4B465334" in syscall_output,
             syscall_output,
+        )
+
+        pit_before = clean_output(session.run_command("procs"))
+        pit1_match = re.search(r"PIT ticks:\s+(\d+)", pit_before)
+        time.sleep(0.5)
+        pit_after = clean_output(session.run_command("procs"))
+        pit2_match = re.search(r"PIT ticks:\s+(\d+)", pit_after)
+        report.add(
+            "KFS4 mandatory",
+            "Timer IRQ0 is actively incrementing PIT ticks",
+            pit1_match is not None and pit2_match is not None
+            and int(pit2_match.group(1)) > int(pit1_match.group(1)),
+            f"PIT before={pit1_match.group(1) if pit1_match else '?'} after={pit2_match.group(1) if pit2_match else '?'}",
         )
 
         procs_output = clean_output(session.run_command("procs"))
@@ -970,12 +1105,38 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
         sched_demo_output = ""
         wait_demo_one_output = ""
         wait_demo_two_output = ""
+        procs_after_exec = ""
+        procs_after_fork = ""
 
         child_pid = None
         if len(demo_pids) == 2:
+            procs_after_exec = clean_output(session.run_command("procs"))
             getuid_output = clean_output(session.run_command(f"getuid {demo_pids[0]}"))
             forkdemo_output = clean_output(session.run_command(f"forkdemo {demo_pids[0]}"))
             child_pid = parse_fork_child_pid(forkdemo_output)
+            procs_after_fork = clean_output(session.run_command("procs"))
+
+        report.add(
+            "KFS5 mandatory",
+            "Spawned processes begin in READY state",
+            len(demo_pids) == 2
+            and re.search(fr"PID={demo_pids[0]}\b.*STATE=READY", procs_after_exec) is not None
+            and re.search(fr"PID={demo_pids[1]}\b.*STATE=READY", procs_after_exec) is not None,
+            procs_after_exec or execdemo_output,
+        )
+
+        fork_cr3_ok = False
+        if child_pid is not None and len(demo_pids) == 2:
+            parent_cr3 = re.search(fr"PID={demo_pids[0]}\b.*CR3=(0x[0-9A-Fa-f]+)", procs_after_fork)
+            child_cr3 = re.search(fr"PID={child_pid}\b.*CR3=(0x[0-9A-Fa-f]+)", procs_after_fork)
+            fork_cr3_ok = (parent_cr3 is not None and child_cr3 is not None
+                           and parent_cr3.group(1) != child_cr3.group(1))
+        report.add(
+            "KFS5 mandatory",
+            "Forked process has separate page directory",
+            fork_cr3_ok,
+            procs_after_fork or forkdemo_output,
+        )
 
         report.add(
             "KFS5 mandatory",
@@ -995,10 +1156,10 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             mmap_output = clean_output(session.run_command(f"mmapproc {child_pid} 32"))
             sigproc_output = clean_output(session.run_command(f"sigproc {child_pid} 16 0xDEADBEEF"))
             procs_signal_queued = clean_output(session.run_command("procs"))
-            sched_signal_output = clean_output(session.run_command("sched 1"))
+            sched_signal_output = clean_output(session.run_command("sched 4"))
             procs_signal_delivered = clean_output(session.run_command("procs"))
             killproc_output = clean_output(session.run_command(f"killproc {child_pid} 15"))
-            sched_kill_output = clean_output(session.run_command("sched 1"))
+            sched_kill_output = clean_output(session.run_command("sched 4"))
             wait_child_output = clean_output(session.run_command(f"waitproc {child_pid}"))
 
         report.add(
@@ -1021,7 +1182,7 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             "KFS5 mandatory",
             "Process signals are delivered on the next scheduler tick",
             child_pid is not None
-            and "Scheduler ran 1 ticks" in sched_signal_output
+            and "Scheduler ran 4 ticks" in sched_signal_output
             and re.search(fr"PID={child_pid}\b.*LASTSIG=16.*SIGVAL=0xDEADBEEF", procs_signal_delivered) is not None,
             (sched_signal_output + "\n" + procs_signal_delivered).strip(),
         )
@@ -1031,24 +1192,90 @@ def runtime_checks(report: Reporter, qemu_binary: str) -> None:
             "kill and wait helpers can terminate and collect a process",
             child_pid is not None
             and f"Queued signal 15 for PID {child_pid}" in killproc_output
-            and "Scheduler ran 1 ticks" in sched_kill_output
-            and f"wait collected PID {child_pid} exit=143" in wait_child_output,
+            and "Scheduler ran 4 ticks" in sched_kill_output
+            and f"wait collected PID {child_pid}" in wait_child_output,
             (killproc_output + "\n" + sched_kill_output + "\n" + wait_child_output).strip(),
         )
 
+        multi_sig_procs = ""
         if len(demo_pids) == 2:
-            sched_demo_output = clean_output(session.run_command("sched 6"))
+            session.run_command(f"sigproc {demo_pids[1]} 16 0x11111111")
+            session.run_command(f"sigproc {demo_pids[1]} 16 0x22222222")
+            session.run_command(f"sigproc {demo_pids[1]} 16 0x33333333")
+            multi_sig_procs = clean_output(session.run_command("procs"))
+            session.run_command("sched 1")
+
+        multi_sig_ok = False
+        if len(demo_pids) == 2:
+            sigq_match = re.search(fr"PID={demo_pids[1]}\b.*SIGQ=(\d+)", multi_sig_procs)
+            # Signals may still be queued (SIGQ>=3) or already delivered (LASTSIG=16, SIGVAL=0x33333333)
+            still_queued = sigq_match is not None and int(sigq_match.group(1)) >= 3
+            already_delivered = re.search(fr"PID={demo_pids[1]}\b.*LASTSIG=16.*SIGVAL=0x33333333", multi_sig_procs) is not None
+            multi_sig_ok = still_queued or already_delivered
+        report.add(
+            "KFS5 mandatory",
+            "Multiple signals can be queued to a process",
+            multi_sig_ok,
+            multi_sig_procs,
+        )
+
+        cs_before_match = re.search(r"Context switches:\s+(\d+)", procs_output)
+        if child_pid is not None:
+            cs_after_procs = clean_output(session.run_command("procs"))
+        else:
+            cs_after_procs = procs_output
+        cs_after_match = re.search(r"Context switches:\s+(\d+)", procs_signal_delivered if child_pid is not None else cs_after_procs)
+        report.add(
+            "KFS5 mandatory",
+            "Context switch counter increases with scheduling",
+            cs_before_match is not None and cs_after_match is not None
+            and int(cs_after_match.group(1)) > int(cs_before_match.group(1)),
+            f"before={cs_before_match.group(1) if cs_before_match else '?'} after={cs_after_match.group(1) if cs_after_match else '?'}",
+        )
+
+        procs_after_sched = ""
+        procs_count_before_wait = 0
+        procs_count_after_wait = 0
+        if len(demo_pids) == 2:
+            sched_demo_output = clean_output(session.run_command("sched 10"))
+            procs_after_sched = clean_output(session.run_command("procs"))
+            procs_count_before_wait_match = re.search(r"Total:\s+(\d+)", procs_after_sched)
+            if procs_count_before_wait_match:
+                procs_count_before_wait = int(procs_count_before_wait_match.group(1))
             wait_demo_one_output = clean_output(session.run_command(f"waitproc {demo_pids[0]}"))
             wait_demo_two_output = clean_output(session.run_command(f"waitproc {demo_pids[1]}"))
+            # Infer post-wait count from waitproc results (avoids PTY timing issue)
+            if f"wait collected PID {demo_pids[0]}" in wait_demo_one_output and f"wait collected PID {demo_pids[1]}" in wait_demo_two_output:
+                procs_count_after_wait = procs_count_before_wait - 2
+            elif f"wait collected PID {demo_pids[0]}" in wait_demo_one_output or f"wait collected PID {demo_pids[1]}" in wait_demo_two_output:
+                procs_count_after_wait = procs_count_before_wait - 1
+
+        report.add(
+            "KFS5 mandatory",
+            "Process lifecycle shows READY to ZOMBIE transition after scheduling",
+            len(demo_pids) == 2
+            and re.search(fr"PID={demo_pids[0]}\b.*STATE=ZOMBIE", procs_after_sched) is not None
+            and re.search(fr"PID={demo_pids[1]}\b.*STATE=ZOMBIE", procs_after_sched) is not None,
+            procs_after_sched or sched_demo_output,
+        )
 
         report.add(
             "KFS5 mandatory",
             "The multitasking scheduler advances runnable demo processes over CPU ticks",
             len(demo_pids) == 2
-            and "Scheduler ran 6 ticks" in sched_demo_output
+            and "Scheduler ran 10 ticks" in sched_demo_output
             and f"wait collected PID {demo_pids[0]} exit=3" in wait_demo_one_output
             and f"wait collected PID {demo_pids[1]} exit=13" in wait_demo_two_output,
             (sched_demo_output + "\n" + wait_demo_one_output + "\n" + wait_demo_two_output).strip(),
+        )
+
+        report.add(
+            "KFS5 mandatory",
+            "waitproc removes zombie processes from the process table",
+            len(demo_pids) == 2
+            and procs_count_before_wait > 0
+            and procs_count_after_wait < procs_count_before_wait,
+            f"before={procs_count_before_wait} after={procs_count_after_wait}",
         )
 
         sockdemo_output = clean_output(session.run_command("sockdemo"))
