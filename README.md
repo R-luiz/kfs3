@@ -97,7 +97,7 @@ sudo apt install gcc nasm qemu-system-x86 gcc-multilib
 ```bash
 make        # Build the kernel
 make run    # Run in QEMU (auto-falls back to headless serial if no GUI backend exists)
-make test-kfs  # Run the automated KFS-2/KFS-3/KFS-4/KFS-5 test suite
+make test-kfs  # Run the automated KFS-2 / KFS-3 / KFS-4 / KFS-5 test suite
 ```
 
 ### All Make Targets
