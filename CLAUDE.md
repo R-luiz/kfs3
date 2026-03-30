@@ -40,7 +40,7 @@ GRUB loads kernel at 0x100000 → [boot/boot.asm](boot/boot.asm) sets up stack a
 | Virtual memory (vmalloc) | `0x01000000 – 0x10000000` |
 | Per-process mmap regions | `0x02000000+` |
 
-Key constants: `PAGE_SIZE=4KB`, `MAX_PROCESSES=16`, `QEMU_MEMORY=128MB`, timer at `1000 Hz` (IRQ0).
+Key constants: `PAGE_SIZE=4KB`, `MAX_PROCESSES=16`, `QEMU_MEMORY=128MB`, timer at `50 Hz` (IRQ0).
 
 ### Subsystem Map
 - **[boot/boot.asm](boot/boot.asm)** — Multiboot entry, stack setup
@@ -63,7 +63,7 @@ Key constants: `PAGE_SIZE=4KB`, `MAX_PROCESSES=16`, `QEMU_MEMORY=128MB`, timer a
 ### Process States
 `READY → RUNNING → WAITING → ZOMBIE` (plus `THREAD` for kernel threads). Scheduler is round-robin triggered by IRQ0.
 
-
+## Development Workflow
 
 ### 1. Plan Mode Default
 - Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
