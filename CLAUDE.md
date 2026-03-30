@@ -38,14 +38,14 @@ GRUB loads kernel at 0x100000 → [boot/boot.asm](boot/boot.asm) sets up stack a
 | Kernel code/data/BSS | `0x00100000 – kernel_end` |
 | Kernel heap (kmalloc) | `kernel_end – 0x01000000` |
 | Virtual memory (vmalloc) | `0x01000000 – 0x10000000` |
-| Per-process mmap regions | `0x02000000+` |
+| Per-process mmap regions | `0x02000000+` (within vmalloc range, tracked separately) |
 
 Key constants: `PAGE_SIZE=4KB`, `MAX_PROCESSES=16`, `QEMU_MEMORY=128MB`, timer at `50 Hz` (IRQ0).
 
 ### Subsystem Map
 - **[boot/boot.asm](boot/boot.asm)** — Multiboot entry, stack setup
 - **[boot/linker.ld](boot/linker.ld)** — Kernel placed at 1MB, exports `kernel_start`/`kernel_end`
-- **[kernel/src/gdt.c](kernel/src/gdt.c)** — 7-descriptor GDT (kernel/user code+data + TSS stubs)
+- **[kernel/src/gdt.c](kernel/src/gdt.c)** — 7-descriptor GDT: null + kernel code/data/stack + user code/data/stack
 - **[kernel/src/idt.c](kernel/src/idt.c)** + **[interrupts.asm](kernel/src/interrupts.asm)** — 256-entry IDT, PIC remapped to IRQ 32–47
 - **[kernel/src/pmm.c](kernel/src/pmm.c)** — Bitmap-based physical page frame allocator (parses multiboot memory map)
 - **[kernel/src/paging.c](kernel/src/paging.c)** — 4KB pages, identity-maps kernel region, per-process page directories, TLB flushing

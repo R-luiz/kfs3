@@ -12,6 +12,14 @@ static const char scancode_to_ascii[] = {
     '*', 0, ' '
 };
 
+static const char scancode_to_ascii_shift[] = {
+    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
+    '*', 0, ' '
+};
+
 static volatile char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
 static volatile uint32_t keyboard_head = 0;
 static volatile uint32_t keyboard_tail = 0;
@@ -68,10 +76,13 @@ void keyboard_handler(void)
     if ((scancode & 0x80) != 0 || scancode >= sizeof(scancode_to_ascii))
         return;
 
-    if (scancode_to_ascii[scancode] != 0) {
-        char c = scancode_to_ascii[scancode];
-        keyboard_queue_char(c);
-        schedule_signal(KERNEL_SIGNAL_KEYBOARD, (uint32_t)(uint8_t)c, NULL);
+    {
+        const char *table = shift_held ? scancode_to_ascii_shift : scancode_to_ascii;
+        char c = table[scancode];
+        if (c != 0) {
+            keyboard_queue_char(c);
+            schedule_signal(KERNEL_SIGNAL_KEYBOARD, (uint32_t)(uint8_t)c, NULL);
+        }
     }
 }
 
@@ -124,6 +135,7 @@ char keyboard_getchar(void)
     char c;
 
     while (!keyboard_try_read_char(&c)) {
+        __asm__ volatile("hlt");
     }
     return c;
 }
