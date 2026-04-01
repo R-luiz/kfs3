@@ -20,37 +20,56 @@ static uint16_t* const VGA_MEMORY = (uint16_t*)0xB8000;
 static const size_t VGA_WIDTH = 80;
 static const size_t VGA_HEIGHT = 25;
 
-static size_t terminal_row;
+#define SCROLLBACK_LINES 200
+
+static uint16_t scroll_buffer[SCROLLBACK_LINES * 80];
+static size_t terminal_row;      /* cursor row in scroll_buffer (0 to SCROLLBACK_LINES-1) */
 static size_t terminal_column;
 static uint8_t terminal_color;
+static size_t scroll_offset;     /* lines scrolled back from bottom (0 = live view) */
 
 extern uint8_t stack_bottom;
 extern uint8_t stack_top;
 
-/* Update hardware cursor position */
+static size_t display_start(void) {
+    return (terminal_row >= VGA_HEIGHT) ? terminal_row - VGA_HEIGHT + 1 : 0;
+}
+
 static void update_cursor(void) {
-    uint16_t pos = terminal_row * VGA_WIDTH + terminal_column;
+    uint16_t pos;
+    if (scroll_offset != 0) {
+        pos = VGA_HEIGHT * VGA_WIDTH; /* off-screen */
+    } else {
+        size_t visible_row = terminal_row - display_start();
+        pos = visible_row * VGA_WIDTH + terminal_column;
+    }
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
     outb(0x3D4, 0x0E);
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
 }
 
-/* Scroll the terminal up by one line */
-static void terminal_scroll(void) {
-    /* Move all lines up by one */
+static void terminal_refresh_display(void);
+
+/* Scroll the buffer up by one line (called when buffer is full) */
+static void terminal_scroll_buffer(void) {
+    for (size_t i = 0; i < (SCROLLBACK_LINES - 1) * VGA_WIDTH; i++)
+        scroll_buffer[i] = scroll_buffer[i + VGA_WIDTH];
+    uint16_t blank = vga_entry(' ', terminal_color);
+    for (size_t x = 0; x < VGA_WIDTH; x++)
+        scroll_buffer[(SCROLLBACK_LINES - 1) * VGA_WIDTH + x] = blank;
+    terminal_row = SCROLLBACK_LINES - 1;
+}
+
+/* Scroll the VGA display up by one line (fast path for live view) */
+static void vga_scroll(void) {
     for (size_t y = 1; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            size_t src_index = y * VGA_WIDTH + x;
-            size_t dst_index = (y - 1) * VGA_WIDTH + x;
-            VGA_MEMORY[dst_index] = VGA_MEMORY[src_index];
-        }
+        for (size_t x = 0; x < VGA_WIDTH; x++)
+            VGA_MEMORY[(y - 1) * VGA_WIDTH + x] = VGA_MEMORY[y * VGA_WIDTH + x];
     }
-    /* Clear the last line */
-    for (size_t x = 0; x < VGA_WIDTH; x++) {
-        size_t index = (VGA_HEIGHT - 1) * VGA_WIDTH + x;
-        VGA_MEMORY[index] = vga_entry(' ', terminal_color);
-    }
+    uint16_t blank = vga_entry(' ', terminal_color);
+    for (size_t x = 0; x < VGA_WIDTH; x++)
+        VGA_MEMORY[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = blank;
 }
 
 const char* HEADER[] = {
@@ -72,22 +91,25 @@ void terminal_initialize(void)
 {
     terminal_row = 0;
     terminal_column = 0;
+    scroll_offset = 0;
     terminal_color = vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
-    /* Clear the screen */
-    for (size_t y = 0; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            const size_t index = y * VGA_WIDTH + x;
-            VGA_MEMORY[index] = vga_entry(' ', terminal_color);
-        }
-    }
+    uint16_t blank = vga_entry(' ', terminal_color);
+    for (size_t i = 0; i < SCROLLBACK_LINES * VGA_WIDTH; i++)
+        scroll_buffer[i] = blank;
+    for (size_t i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++)
+        VGA_MEMORY[i] = blank;
     update_cursor();
 }
 
-static void terminal_putchar_at(char c, uint8_t color, size_t x, size_t y) 
+static void terminal_putchar_at(char c, uint8_t color, size_t x, size_t y)
 {
-    const size_t index = y * VGA_WIDTH + x;
-    VGA_MEMORY[index] = vga_entry(c, color);
+    scroll_buffer[y * VGA_WIDTH + x] = vga_entry(c, color);
+    if (scroll_offset == 0) {
+        size_t ds = display_start();
+        if (y >= ds && y < ds + VGA_HEIGHT)
+            VGA_MEMORY[(y - ds) * VGA_WIDTH + x] = vga_entry(c, color);
+    }
 }
 
 static size_t strlen(const char* str) {
@@ -101,8 +123,13 @@ void terminal_putchar(char c)
 {
     serial_write_char(c);
 
+    /* Snap back to bottom on any output while scrolled */
+    if (scroll_offset != 0) {
+        scroll_offset = 0;
+        terminal_refresh_display();
+    }
+
     if (c == '\b') {
-        /* Handle backspace: move cursor back and erase character */
         if (terminal_column > 0) {
             terminal_column--;
         } else if (terminal_row > 0) {
@@ -116,10 +143,13 @@ void terminal_putchar(char c)
 
     if (c == '\n') {
         terminal_column = 0;
+        size_t old_ds = display_start();
         terminal_row++;
-        if (terminal_row == VGA_HEIGHT) {
-            terminal_scroll();
-            terminal_row = VGA_HEIGHT - 1;
+        if (terminal_row == SCROLLBACK_LINES) {
+            terminal_scroll_buffer();
+            terminal_refresh_display();
+        } else if (display_start() != old_ds) {
+            vga_scroll();
         }
         update_cursor();
         return;
@@ -129,19 +159,55 @@ void terminal_putchar(char c)
 
     if (++terminal_column == VGA_WIDTH) {
         terminal_column = 0;
+        size_t old_ds = display_start();
         terminal_row++;
-        if (terminal_row == VGA_HEIGHT) {
-            terminal_scroll();
-            terminal_row = VGA_HEIGHT - 1;
+        if (terminal_row == SCROLLBACK_LINES) {
+            terminal_scroll_buffer();
+            terminal_refresh_display();
+        } else if (display_start() != old_ds) {
+            vga_scroll();
         }
     }
     update_cursor();
 }
 
-void terminal_write(const char* str) 
+void terminal_write(const char* str)
 {
     for (size_t i = 0; str[i] != '\0'; i++)
         terminal_putchar(str[i]);
+}
+
+static void terminal_refresh_display(void)
+{
+    size_t ds = display_start();
+    if (ds >= scroll_offset)
+        ds -= scroll_offset;
+    else
+        ds = 0;
+
+    for (size_t y = 0; y < VGA_HEIGHT; y++) {
+        for (size_t x = 0; x < VGA_WIDTH; x++)
+            VGA_MEMORY[y * VGA_WIDTH + x] = scroll_buffer[(ds + y) * VGA_WIDTH + x];
+    }
+    update_cursor();
+}
+
+void terminal_scroll_up(size_t lines)
+{
+    size_t max_offset = (terminal_row >= VGA_HEIGHT) ? terminal_row - VGA_HEIGHT + 1 : 0;
+    scroll_offset += lines;
+    if (scroll_offset > max_offset)
+        scroll_offset = max_offset;
+    terminal_refresh_display();
+}
+
+void terminal_scroll_down(size_t lines)
+{
+    if (scroll_offset >= lines)
+        scroll_offset -= lines;
+    else
+        scroll_offset = 0;
+    terminal_refresh_display();
 }
 
 static void terminal_writestr_centered(const char* str, size_t row) 

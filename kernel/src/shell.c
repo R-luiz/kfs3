@@ -16,10 +16,12 @@
 
 #define SHELL_BUFFER_SIZE 256
 
-/* External terminal routines that are now public (see main.c modifications) */
+/* External terminal routines */
 extern void terminal_putchar(char c);
 extern void terminal_write(const char* str);
 extern void terminal_initialize(void);
+extern void terminal_scroll_up(size_t lines);
+extern void terminal_scroll_down(size_t lines);
 
 /* A few very basic string helper functions */
 static int strcmp(const char *s1, const char *s2) {
@@ -280,6 +282,7 @@ static void invop_test_handler(cpu_registers_t *regs)
 
 /*
  * shell_getchar: reads shell input from serial or the keyboard IRQ buffer.
+ * Scroll keys are handled internally and never returned to the caller.
  */
 static char shell_getchar(void) {
     while (1) {
@@ -303,6 +306,22 @@ static char shell_getchar(void) {
         }
 
         if (keyboard_try_read_char(&keyboard_char)) {
+            if (keyboard_char == KEY_PAGE_UP) {
+                terminal_scroll_up(24);
+                continue;
+            }
+            if (keyboard_char == KEY_PAGE_DOWN) {
+                terminal_scroll_down(24);
+                continue;
+            }
+            if (keyboard_char == KEY_ARROW_UP && keyboard_shift_held()) {
+                terminal_scroll_up(1);
+                continue;
+            }
+            if (keyboard_char == KEY_ARROW_DOWN && keyboard_shift_held()) {
+                terminal_scroll_down(1);
+                continue;
+            }
             return keyboard_char;
         }
     }

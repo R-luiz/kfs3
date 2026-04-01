@@ -12,9 +12,19 @@ static const char scancode_to_ascii[] = {
     '*', 0, ' '
 };
 
+static const char scancode_to_ascii_shift[] = {
+    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
+    '*', 0, ' '
+};
+
 static volatile char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
 static volatile uint32_t keyboard_head = 0;
 static volatile uint32_t keyboard_tail = 0;
+static volatile int shift_held = 0;
+static volatile int extended_prefix = 0;
 
 static void keyboard_queue_char(char c)
 {
@@ -38,15 +48,47 @@ void keyboard_handler(void)
 {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
 
-    if (scancode >= sizeof(scancode_to_ascii) || (scancode & 0x80) != 0) {
+    /* Track shift state */
+    if (scancode == 0x2A || scancode == 0x36) { shift_held = 1; return; }
+    if (scancode == 0xAA || scancode == 0xB6) { shift_held = 0; return; }
+
+    /* Extended scancode prefix */
+    if (scancode == 0xE0) { extended_prefix = 1; return; }
+
+    if (extended_prefix) {
+        extended_prefix = 0;
+        if (scancode & 0x80) return; /* release of extended key */
+        char key = 0;
+        switch (scancode) {
+        case 0x48: key = KEY_ARROW_UP;   break;
+        case 0x50: key = KEY_ARROW_DOWN; break;
+        case 0x49: key = KEY_PAGE_UP;    break;
+        case 0x51: key = KEY_PAGE_DOWN;  break;
+        }
+        if (key) {
+            keyboard_queue_char(key);
+            schedule_signal(KERNEL_SIGNAL_KEYBOARD, (uint32_t)(uint8_t)key, NULL);
+        }
         return;
     }
 
-    if (scancode_to_ascii[scancode] != 0) {
-        char c = scancode_to_ascii[scancode];
-        keyboard_queue_char(c);
-        schedule_signal(KERNEL_SIGNAL_KEYBOARD, (uint32_t)(uint8_t)c, NULL);
+    /* Ignore key releases and out-of-range scancodes */
+    if ((scancode & 0x80) != 0 || scancode >= sizeof(scancode_to_ascii))
+        return;
+
+    {
+        const char *table = shift_held ? scancode_to_ascii_shift : scancode_to_ascii;
+        char c = table[scancode];
+        if (c != 0) {
+            keyboard_queue_char(c);
+            schedule_signal(KERNEL_SIGNAL_KEYBOARD, (uint32_t)(uint8_t)c, NULL);
+        }
     }
+}
+
+int keyboard_shift_held(void)
+{
+    return shift_held;
 }
 
 void init_keyboard(void)
@@ -93,6 +135,7 @@ char keyboard_getchar(void)
     char c;
 
     while (!keyboard_try_read_char(&c)) {
+        __asm__ volatile("hlt");
     }
     return c;
 }
