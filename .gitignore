@@ -63,3 +63,8 @@ build/
 # Python
 __pycache__/
 *.pyc
+
+CLAUDE.md
+kernel.bin
+explore.md
+kernel-reviewer.md
